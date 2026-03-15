@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
+"""
+Brief:
+Run local DiP-style trans_dec inference and save decoded HumanML motions.
+"""
 import argparse
+import json
 import os
+
 import numpy as np
 import torch
 
-from data_loaders.tensors import collate
 from data_loaders.humanml.scripts.motion_process import recover_from_ric
+from data_loaders.humanml.utils import paramUtil
+from data_loaders.humanml.utils.plot_script import plot_3d_motion
+from data_loaders.tensors import collate
 from utils import dist_util
 from utils.fixseed import fixseed
 from utils.model_util import create_model_and_diffusion, load_saved_model
@@ -21,33 +29,36 @@ from utils.parser_util import (
     get_cond_mode,
     load_args_from_model,
 )
-from utils.sampler_util import ClassifierFreeSampleModel
+from utils.sampler_util import AutoRegressiveSampler, ClassifierFreeSampleModel
 
 
 class _DummyData:
     dataset = type("Dataset", (), {})()
 
 
+def _coerce_bool(value) -> bool:
+    if isinstance(value, str):
+        return value.lower() in ("1", "true", "yes")
+    return bool(value)
+
+
+def _read_model_args(model_path: str) -> dict:
+    args_path = os.path.join(os.path.dirname(model_path), "args.json")
+    if not os.path.exists(args_path):
+        return {}
+    with open(args_path, "r") as fr:
+        return json.load(fr)
+
+
 def _build_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Minimal HumanML text inference (trans_dec).")
+    parser = argparse.ArgumentParser(description="DiP-style HumanML text inference (trans_dec only).")
     add_base_options(parser)
     add_sampling_options(parser)
     add_generate_options(parser)
     add_data_options(parser)
     add_model_options(parser)
     add_diffusion_options(parser)
-    parser.add_argument(
-        "--out",
-        default="outputs/sample.npy",
-        type=str,
-        help="Output .npy path for results dict.",
-    )
-    parser.add_argument(
-        "--sample_steps",
-        default=0,
-        type=int,
-        help="Sampling steps for logSNR spacing. 0 = use diffusion_steps.",
-    )
+    parser.add_argument("--out", default="outputs/sample.npy", type=str, help="Output .npy path.")
     parser.add_argument(
         "--force_use_ema",
         action="store_true",
@@ -66,6 +77,10 @@ def _build_args() -> argparse.Namespace:
         args_to_overwrite += get_args_per_group_name(parser, args, group_name)
     args = load_args_from_model(args, args_to_overwrite)
 
+    model_args = _read_model_args(args.model_path)
+    if "autoregressive" in model_args:
+        args.autoregressive = _coerce_bool(model_args["autoregressive"])
+
     if args.force_use_ema:
         args.use_ema = True
     if args.cond_mask_prob == 0:
@@ -76,38 +91,116 @@ def _build_args() -> argparse.Namespace:
 def _resolve_data_root(args: argparse.Namespace) -> str:
     if getattr(args, "data_dir", ""):
         return args.data_dir
-    # HumanML default
     return "./dataset/HumanML3D"
+
+
+def _build_model_kwargs(model, args, texts, n_frames):
+    if args.context_len > 0:
+        inp = torch.zeros(model.njoints, model.nfeats, args.pred_len)
+        prefix = torch.zeros(model.njoints, model.nfeats, args.context_len)
+        collate_args = [{"inp": inp, "prefix": prefix, "lengths": args.pred_len}] * args.num_samples
+    else:
+        collate_args = [{"inp": torch.zeros(n_frames), "lengths": n_frames}] * args.num_samples
+
+    collate_args = [dict(arg, text=txt) for arg, txt in zip(collate_args, texts)]
+    _, model_kwargs = collate(collate_args)
+    model_kwargs["y"] = {
+        key: val.to(dist_util.dev()) if torch.is_tensor(val) else val
+        for key, val in model_kwargs["y"].items()
+    }
+    return model_kwargs
+
+
+def _read_text_lines(path: str):
+    if not os.path.exists(path):
+        raise SystemExit(f"text file not found: {path}")
+    with open(path, "r") as f:
+        lines = [line.strip() for line in f.readlines()]
+    return [line for line in lines if line]
+
+
+def _prepare_text_condition(model, args, texts, dynamic_texts, num_samples):
+    if dynamic_texts is None:
+        text_embed = model.encode_text(texts)
+        return texts, text_embed
+
+    text_embed = model.encode_text(dynamic_texts)
+    return (
+        [list(dynamic_texts) for _ in range(num_samples)],
+        (
+            text_embed[0].permute(1, 0, 2).unsqueeze(0).repeat(num_samples, 1, 1, 1),
+            text_embed[1].unsqueeze(0).repeat(num_samples, 1, 1),
+        ),
+    )
+
+
+def _expand_dynamic_caption(caption, length, pred_len):
+    if not isinstance(caption, list):
+        return caption
+    if pred_len <= 0:
+        return [caption[min(i, len(caption) - 1)] for i in range(length)]
+    title = []
+    for segment_text in caption:
+        title.extend([segment_text] * pred_len)
+        if len(title) >= length:
+            break
+    if not title:
+        return ""
+    if len(title) < length:
+        title.extend([title[-1]] * (length - len(title)))
+    return title[:length]
+
+
+def _resolve_target_frames(args, fps, max_frames, dynamic_texts):
+    if dynamic_texts is not None:
+        return len(dynamic_texts) * args.pred_len
+    target_frames = int(args.motion_length * fps)
+    if args.autoregressive:
+        return target_frames
+    return min(max_frames, target_frames)
 
 
 def main():
     args = _build_args()
     dist_util.setup_dist(args.device)
+    if not 0.0 <= args.dynamic_text_blend <= 1.0:
+        raise SystemExit("dynamic_text_blend must be between 0 and 1.")
+    if args.autoregressive_motion_blend_frames < 0:
+        raise SystemExit("autoregressive_motion_blend_frames must be >= 0.")
 
-    cond_mode = get_cond_mode(args)
-    if cond_mode != "text":
-        raise SystemExit(f"Only text-conditioned models are supported, got {cond_mode!r}.")
+    if get_cond_mode(args) != "text":
+        raise SystemExit("Only text-conditioned models are supported.")
+    if args.dataset != "humanml":
+        raise SystemExit("Only HumanML checkpoints are supported in this script.")
     if args.arch != "trans_dec":
-        raise SystemExit("Only trans_dec checkpoints are supported in this minimal script.")
+        raise SystemExit("Only trans_dec checkpoints are supported in this script.")
     if args.text_encoder_type != "bert":
-        raise SystemExit("Only BERT text encoder is supported in this minimal script.")
-    if not args.text_prompt and not args.input_text:
-        raise SystemExit("Provide --text_prompt or --input_text.")
+        raise SystemExit("Only BERT text encoder is supported in this script.")
+    if args.autoregressive and (args.context_len <= 0 or args.pred_len <= 0):
+        raise SystemExit("Autoregressive sampling requires context_len > 0 and pred_len > 0.")
+    if not args.text_prompt and not args.input_text and not args.dynamic_text_path:
+        raise SystemExit("Provide --text_prompt, --input_text, or --dynamic_text_path.")
 
     max_frames = 196
     fps = 20
-    n_frames = min(max_frames, int(args.motion_length * fps))
-    if n_frames <= 0:
-        raise SystemExit("motion_length too small for current FPS.")
-
+    dynamic_texts = None
     if args.text_prompt:
         texts = [args.text_prompt] * args.num_samples
     else:
-        if not os.path.exists(args.input_text):
-            raise SystemExit(f"input_text not found: {args.input_text}")
-        with open(args.input_text, "r") as f:
-            texts = [line.strip() for line in f.readlines() if line.strip()]
-        args.num_samples = len(texts)
+        if args.dynamic_text_path:
+            if not args.autoregressive:
+                raise SystemExit("Dynamic text sampling requires --autoregressive.")
+            dynamic_texts = _read_text_lines(args.dynamic_text_path)
+            if not dynamic_texts:
+                raise SystemExit("dynamic_text_path is empty.")
+            texts = [dynamic_texts[0]] * args.num_samples
+        else:
+            texts = _read_text_lines(args.input_text)
+            args.num_samples = len(texts)
+    n_frames = _resolve_target_frames(args, fps, max_frames, dynamic_texts)
+
+    if n_frames <= 0:
+        raise SystemExit("motion_length too small for current FPS.")
 
     args.batch_size = args.num_samples
 
@@ -122,20 +215,30 @@ def main():
     model.to(dist_util.dev())
     model.eval()
 
-    collate_args = [{"inp": torch.zeros(n_frames), "tokens": None, "lengths": n_frames}] * args.num_samples
-    collate_args = [dict(arg, text=txt) for arg, txt in zip(collate_args, texts)]
-    _, model_kwargs = collate(collate_args)
-
-    model_kwargs["y"] = {
-        key: val.to(dist_util.dev()) if torch.is_tensor(val) else val
-        for key, val in model_kwargs["y"].items()
-    }
-
+    model_kwargs = _build_model_kwargs(model, args, texts, n_frames)
     if args.guidance_param != 1:
         model_kwargs["y"]["scale"] = torch.ones(args.batch_size, device=dist_util.dev()) * args.guidance_param
+    model_kwargs["y"]["text"], model_kwargs["y"]["text_embed"] = _prepare_text_condition(
+        model,
+        args,
+        model_kwargs["y"]["text"],
+        dynamic_texts,
+        args.num_samples,
+    )
 
-    sample_steps = args.sample_steps or args.diffusion_steps
-    motion_shape = (args.batch_size, model.njoints, model.nfeats, n_frames)
+    def base_sample_fn(model_obj, shape, **sample_kwargs):
+        return diffusion.p_sample_loop(
+            model_obj,
+            shape,
+            **sample_kwargs,
+        )
+
+    sample_fn = base_sample_fn
+    if args.autoregressive:
+        sample_fn = AutoRegressiveSampler(args, base_sample_fn, n_frames).sample
+
+    sample_frames = n_frames if args.autoregressive or args.context_len == 0 else args.pred_len
+    motion_shape = (args.batch_size, model.njoints, model.nfeats, sample_frames)
 
     all_motions = []
     all_lengths = []
@@ -149,22 +252,14 @@ def main():
         fixseed(args.seed)
         for rep_i in range(args.num_repetitions):
             print(f"Sampling repetition {rep_i + 1}/{args.num_repetitions}...")
-            sample = diffusion.logsnr_sample_loop(
+            sample = sample_fn(
                 model,
                 motion_shape,
                 clip_denoised=False,
                 model_kwargs=model_kwargs,
-                skip_timesteps=0,
-                init_image=None,
                 progress=True,
-                dump_steps=None,
-                noise=None,
-                const_noise=False,
-                steps=sample_steps,
-                use_ddim=False,
             )
 
-            # hml_vec -> XYZ joints
             n_joints = 22
             sample = sample.cpu().permute(0, 2, 3, 1)
             sample = sample * std + mean
@@ -172,8 +267,13 @@ def main():
             sample = sample.view(-1, *sample.shape[2:]).permute(0, 2, 3, 1)
 
             all_motions.append(sample.cpu().numpy())
-            _len = model_kwargs["y"]["lengths"].cpu().numpy()
-            all_lengths.append(_len)
+            if args.autoregressive:
+                lengths = np.full((args.batch_size,), n_frames, dtype=np.int64)
+            elif args.context_len > 0:
+                lengths = np.full((args.batch_size,), sample.shape[-1], dtype=np.int64)
+            else:
+                lengths = model_kwargs["y"]["lengths"].cpu().numpy()
+            all_lengths.append(lengths)
             all_text += model_kwargs["y"]["text"]
 
     total_num_samples = args.num_samples * args.num_repetitions
@@ -199,14 +299,9 @@ def main():
 
     mp4_dir = args.mp4_dir.strip()
     if mp4_dir:
-        from data_loaders.humanml.utils.plot_script import plot_3d_motion
-        from data_loaders.humanml.utils import paramUtil
-
         os.makedirs(mp4_dir, exist_ok=True)
-
-        skeleton = paramUtil.kit_kinematic_chain if args.dataset == "kit" else paramUtil.t2m_kinematic_chain
-        total_num_samples = args.num_samples * args.num_repetitions
         print(f"Rendering {total_num_samples} MP4 files to {mp4_dir}...")
+        skeleton = paramUtil.t2m_kinematic_chain
 
         for rep_i in range(args.num_repetitions):
             for sample_i in range(args.num_samples):
@@ -215,10 +310,9 @@ def main():
                 length = int(all_lengths[idx])
                 motion = motion[:length]
 
-                caption = all_text[idx]
+                caption = _expand_dynamic_caption(all_text[idx], length, args.pred_len)
                 save_file = f"sample{sample_i:02d}_rep{rep_i:02d}.mp4"
                 save_path = os.path.join(mp4_dir, save_file)
-
                 clip = plot_3d_motion(
                     save_path,
                     skeleton,

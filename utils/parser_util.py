@@ -1,37 +1,79 @@
+"""
+Brief:
+Define reusable argument-parsing helpers for the DiP-style inference path.
+"""
 from argparse import ArgumentParser
 import argparse
-import os
 import json
+import os
+import sys
 
 
-def parse_and_load_from_model(parser):
+def _get_explicit_cli_dests(parser, candidate_dests, argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    if not candidate_dests:
+        return set()
+
+    option_to_dest = {}
+    candidate_dests = set(candidate_dests)
+    for action in parser._actions:
+        if action.dest in candidate_dests:
+            for option in action.option_strings:
+                option_to_dest[option] = action.dest
+
+    explicit = set()
+    for token in argv:
+        if not token.startswith("-"):
+            continue
+        option = token.split("=", 1)[0]
+        dest = option_to_dest.get(option)
+        if dest is not None:
+            explicit.add(dest)
+    return explicit
+
+
+def parse_and_load_from_model(parser, preserve_cli=None):
     add_data_options(parser)
     add_model_options(parser)
     add_diffusion_options(parser)
     args = parser.parse_args()
+    cli_override_dests = _get_explicit_cli_dests(parser, preserve_cli)
     args_to_overwrite = []
     for group_name in ["dataset", "model", "diffusion"]:
         args_to_overwrite += get_args_per_group_name(parser, args, group_name)
     if args.model_path != "":
-        args = load_args_from_model(args, args_to_overwrite)
+        args = load_args_from_model(
+            args,
+            args_to_overwrite,
+            skip_overwrite_dests=cli_override_dests,
+        )
     if args.cond_mask_prob == 0:
         args.guidance_param = 1
     return apply_rules(args)
 
 
-def load_args_from_model(args, args_to_overwrite):
+def load_args_from_model(args, args_to_overwrite, skip_overwrite_dests=None):
     model_path = args.model_path
     args_path = os.path.join(os.path.dirname(model_path), "args.json")
     assert os.path.exists(args_path), "Arguments json file was not found!"
     with open(args_path, "r") as fr:
         model_args = json.load(fr)
-    for a in args_to_overwrite:
-        if a in model_args.keys():
-            setattr(args, a, model_args[a])
+
+    skip_overwrite_dests = set(skip_overwrite_dests or ())
+    for arg_name in args_to_overwrite:
+        if arg_name in skip_overwrite_dests:
+            continue
+        if arg_name in model_args:
+            setattr(args, arg_name, model_args[arg_name])
     return args
 
 
 def apply_rules(args):
+    if getattr(args, "pred_len", 0) == 0:
+        args.pred_len = getattr(args, "context_len", 0)
+    if getattr(args, "context_len", 0) > 0 and getattr(args, "pred_len", 0) > 0:
+        args.autoregressive = True
     return args
 
 
@@ -58,8 +100,8 @@ def add_base_options(parser):
     group.add_argument("--cuda", default=True, type=bool, help="Use cuda device, otherwise use CPU.")
     group.add_argument("--device", default=0, type=int, help="Device id to use.")
     group.add_argument("--local_rank", default=-1, type=int, help="DDP local rank.")
-    group.add_argument("--seed", default=10, type=int, help="For fixing random seed.")
-    group.add_argument("--batch_size", default=64, type=int, help="Batch size during training.")
+    group.add_argument("--seed", default=10, type=int, help="Random seed.")
+    group.add_argument("--batch_size", default=64, type=int, help="Batch size.")
 
 
 def add_diffusion_options(parser):
@@ -77,13 +119,20 @@ def add_model_options(parser):
     group.add_argument("--layers", default=8, type=int)
     group.add_argument("--model_dim", default=512, type=int)
     group.add_argument("--cond_mask_prob", default=0.1, type=float)
-    group.add_argument("--mask_frames", action="store_true")
+    group.add_argument(
+        "--mask_frames",
+        action="store_true",
+        default=True,
+        help="Mask invalid frames inside the transformer decoder.",
+    )
     group.add_argument("--lambda_rcxyz", default=0.0, type=float)
     group.add_argument("--lambda_vel", default=0.0, type=float)
     group.add_argument("--lambda_fc", default=0.0, type=float)
     group.add_argument("--lambda_target_loc", default=0.0, type=float)
     group.add_argument("--pos_embed_max_len", default=5000, type=int)
     group.add_argument("--use_ema", action="store_true")
+    group.add_argument("--context_len", default=0, type=int)
+    group.add_argument("--pred_len", default=0, type=int)
 
 
 def add_data_options(parser):
@@ -95,18 +144,23 @@ def add_data_options(parser):
 def add_sampling_options(parser):
     group = parser.add_argument_group("sampling")
     group.add_argument("--model_path", required=True, type=str)
-    group.add_argument("--output_dir", default="", type=str)
-    group.add_argument("--num_samples", default=6, type=int)
-    group.add_argument("--num_repetitions", default=3, type=int)
-    group.add_argument("--guidance_param", default=2.5, type=float)
+    group.add_argument("--num_samples", default=1, type=int)
+    group.add_argument("--num_repetitions", default=1, type=int)
+    group.add_argument("--guidance_param", default=7.5, type=float)
+    group.add_argument("--autoregressive", action="store_true")
+    group.add_argument("--autoregressive_include_prefix", action="store_true")
+    group.add_argument("--autoregressive_motion_blend_frames", default=12, type=int)
 
 
 def add_generate_options(parser):
     group = parser.add_argument_group("generate")
     group.add_argument("--motion_length", default=9.8, type=float)
     group.add_argument("--input_text", default="", type=str)
+    group.add_argument("--dynamic_text_path", default="", type=str)
+    group.add_argument("--dynamic_text_blend", default=0.35, type=float)
     group.add_argument("--text_prompt", default="", type=str)
 
 
 def get_cond_mode(args):
+    del args
     return "text"

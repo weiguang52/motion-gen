@@ -1,3 +1,7 @@
+"""
+Brief:
+Collate motion batches for text-conditioned HumanML-style inference.
+"""
 import torch
 
 def lengths_to_mask(lengths, max_len):
@@ -21,27 +25,30 @@ def collate_tensors(batch):
 
 def collate(batch):
     notnone_batches = [b for b in batch if b is not None]
-    databatch = [b['inp'] for b in notnone_batches]
-    if 'lengths' in notnone_batches[0]:
-        lenbatch = [b['lengths'] for b in notnone_batches]
+    databatch = [b["inp"] for b in notnone_batches]
+    if "lengths" in notnone_batches[0]:
+        lenbatch = [b["lengths"] for b in notnone_batches]
     else:
-        lenbatch = [len(b['inp'][0][0]) for b in notnone_batches]
-
+        lenbatch = [len(b["inp"][0][0]) for b in notnone_batches]
 
     databatchTensor = collate_tensors(databatch)
     lenbatchTensor = torch.as_tensor(lenbatch)
     maskbatchTensor = lengths_to_mask(lenbatchTensor, databatchTensor.shape[-1]).unsqueeze(1).unsqueeze(1) # unqueeze for broadcasting
 
     motion = databatchTensor
-    cond = {'y': {'mask': maskbatchTensor, 'lengths': lenbatchTensor}}
+    cond = {"y": {"mask": maskbatchTensor, "lengths": lenbatchTensor}}
 
-    if 'text' in notnone_batches[0]:
-        textbatch = [b['text'] for b in notnone_batches]
-        cond['y'].update({'text': textbatch})
+    if "text" in notnone_batches[0]:
+        textbatch = [b["text"] for b in notnone_batches]
+        cond["y"].update({"text": textbatch})
 
-    if 'tokens' in notnone_batches[0]:
-        textbatch = [b['tokens'] for b in notnone_batches]
-        cond['y'].update({'tokens': textbatch})
+    if "tokens" in notnone_batches[0]:
+        textbatch = [b["tokens"] for b in notnone_batches]
+        cond["y"].update({"tokens": textbatch})
+
+    if "prefix" in notnone_batches[0]:
+        prefixbatch = [b["prefix"] for b in notnone_batches]
+        cond["y"].update({"prefix": collate_tensors(prefixbatch)})
 
     return motion, cond
 
@@ -60,4 +67,3 @@ def t2m_collate(batch, target_batch_size):
         'key': b[7] if len(b) > 7 else None,
     } for b in full_batch]
     return collate(adapted_batch)
-

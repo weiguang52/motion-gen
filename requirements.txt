@@ -1,4 +1,4 @@
-numpy==1.23.5
+numpy==1.26.4
 scipy==1.15.3
 matplotlib==3.9
 tqdm==4.67.1
@@ -6,19 +6,7 @@ pillow==12.0.0
 imageio==2.37.2
 imageio-ffmpeg==0.6.0
 moviepy==1.0.3
-chumpy==0.70
-clip==0.2.0
-smplx==0.1.28
-timm==1.0.22
-torch==1.13.1+cu117
-torchvision==0.14.1+cu117
-torchaudio==0.13.1+cu117
-transformers==4.35.2
-spacy==3.8.11
-python-dotenv==1.2.1
-PyYAML==6.0.3
-requests==2.32.5
-blobfile==3.1.0
-wandb==0.23.1
+torch==2.6.0
+transformers==4.53.3
 fastapi==0.109.2
 uvicorn==0.27.1

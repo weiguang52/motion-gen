@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  bash serve/run_server.sh /path/to/model.pt [--host 0.0.0.0] [--port 8000] [--workers 1] [--device 0] [--log-level info] [--steps 50]
+  bash serve/run_server.sh /path/to/model.pt [--host 0.0.0.0] [--port 8000] [--workers 1] [--device 0] [--log-level info]
 
 Example:
   bash serve/run_server.sh ../save/humanml_trans_dec_512_bert/model000200000.pt --port 9000 --device 0
@@ -17,7 +17,6 @@ PORT="8000"
 WORKERS="1"
 LOG_LEVEL="info"
 DEVICE="0"
-STEPS="50"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -43,10 +42,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --log-level)
       LOG_LEVEL="${2:-}"
-      shift 2
-      ;;
-    --steps)
-      STEPS="${2:-}"
       shift 2
       ;;
     --*)
@@ -75,7 +70,6 @@ fi
 
 export MDM_MODEL_PATH="$MODEL_PATH"
 export MDM_DEVICE="$DEVICE"
-export MDM_STEPS="$STEPS"
 
 exec uvicorn serve.generate_server:app \
   --host "$HOST" \
