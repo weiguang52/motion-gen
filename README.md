@@ -1,59 +1,138 @@
-## 环境配置
+# motion-gen
+
+本仓库用于 HumanML3D 文本到动作推理，当前支持：
+
+- `dit`：单段文本到动作
+- `ar_dit`：自回归分段生成，适合动态文本切换
+- `ddpm` 采样
+- `bert_clip` 文本条件
+
+## 快速上手
+
+### 1. 准备环境
 
 ```bash
 conda create -n motion python=3.10 -y
 conda activate motion
-```
-
-```bash
 pip install -r requirements.txt
+pip install -U "huggingface_hub[cli]"
 ```
 
-下载文本编码器权重：
+### 2. 下载文本编码器权重
 
 ```bash
 mkdir -p language_models
 hf download distilbert/distilbert-base-uncased  --local-dir ./language_models/distilbert-base-uncased
+hf download openai/clip-vit-base-patch32 --local-dir ./language_models/clip-vit-base-patch32
 ```
 
-下载模型：
+### 3. 下载 checkpoint
 
-```python
+仓库默认不提交权重文件，`save/` 目录也在 `.gitignore` 中。
+
+模型通过 ModelScope 下载：
+
+```bash
 pip install modelscope
 
 modelscope download --model wangyicheng2/motion_gen_models
 ```
 
-模型 checkpoint 放在 `save/` 目录下
+下载完成后，请将模型文件整理到仓库根目录下的 `save/` 目录，并确保以下路径存在：
 
-## 当前仓库支持范围
+- `save/ddpm263bert_clip_refiner_dit/model000600000.pt`
+- `save/ar_ardit_cfg40_cosine600k_ctx_strongreg_genprefix_mid_steps6/model000550000.pt`
 
-- `trans_dec`
-- DiP 风格自回归采样
-- DDPM 采样
-- HumanML3D 解码与 MP4 可视化
+下文示例默认使用上述 `save/` 路径。
 
-## 单句推理
+### 4. 单句推理示例
+
+`dit` 用于单句文本生成：
 
 ```bash
 python infer.py \
-  --model_path save/dip/model000600343.pt \
+  --model_path save/ddpm263bert_clip_refiner_dit/model000600000.pt \
   --text_prompt "a person waves both hands" \
   --motion_length 6 \
   --out outputs/sample.npy \
   --mp4_dir outputs/sample_mp4
 ```
 
-默认参数已经对齐到 DiP 推理路径：
+输出文件：
+
+- `outputs/sample.npy`
+- `outputs/sample_mp4/sample00_rep00.mp4`
+
+### 5. 动态文本推理示例
+
+`ar_dit` 用于分段自回归生成：
+
+```bash
+python infer.py \
+  --model_path save/ar_ardit_cfg40_cosine600k_ctx_strongreg_genprefix_mid_steps6/model000550000.pt \
+  --dynamic_text_path assets/example_dynamic_text_prompts.txt \
+  --out outputs/dynamic_blend.npy \
+  --mp4_dir outputs/dynamic_blend_mp4
+```
+
+## 模型与入口
+
+- `dit` checkpoint：单句文本生成整段动作
+- `ar_dit` checkpoint：分段自回归生成，支持 `texts` / `dynamic_text_path`
+- `infer.py`：离线推理，输出 `.npy` 和可选 `.mp4`
+- `serve/generate_server.py`：HTTP 服务
+- `serve/test_stream_client.py`：流式客户端示例
+
+## 当前仓库支持范围
+
+- `dit`
+- `ar_dit`
+- DDPM 采样
+- `bert_clip` 文本条件
+- HumanML3D 解码与 MP4 可视化
+
+## 示例资源
+
+- 单句文本示例：[assets/example_text_prompts.txt](/home/wyc/motion-gen/assets/example_text_prompts.txt)
+- 多段动态文本示例：[assets/example_dynamic_text_prompts.txt](/home/wyc/motion-gen/assets/example_dynamic_text_prompts.txt)
+- DiT 示例动图：[assets/dit_example.gif](/home/wyc/motion-gen/assets/dit_example.gif)
+- DiT 跳跃开合示例：[assets/dit_jumping_jacks.gif](/home/wyc/motion-gen/assets/dit_jumping_jacks.gif)
+- DiT 多阶段示例：[assets/dit_multistage_example.gif](/home/wyc/motion-gen/assets/dit_multistage_example.gif)
+- AR-DiT 示例动图：[assets/ar_dit_example.gif](/home/wyc/motion-gen/assets/ar_dit_example.gif)
+
+### DiT
+
+![DiT example](assets/dit_example.gif)
+
+![DiT jumping jacks](assets/dit_jumping_jacks.gif)
+
+### AR-DiT
+
+![AR-DiT example](assets/ar_dit_example.gif)
+
+![DiT multistage example](assets/dit_multistage_example.gif)
+
+## 单句推理
+
+```bash
+python infer.py \
+  --model_path save/ddpm263bert_clip_refiner_dit/model000600000.pt \
+  --text_prompt "a person waves both hands" \
+  --motion_length 6 \
+  --out outputs/sample.npy \
+  --mp4_dir outputs/sample_mp4
+```
+
+默认行为：
 
 - 自动开启自回归（当 checkpoint 里有 `context_len/pred_len` 时）
-- `guidance_param=7.5`
+- `guidance_param`: `dit=2.5`, `ar_dit=4`
 - `num_samples=1`
 - `num_repetitions=1`
 - `dynamic_text_blend=0.35`
 - `autoregressive_motion_blend_frames=12`
 
-输出的 `.npy` 是一个 dict：
+输出的 `.npy` 为一个字典：
 
 - `motion`：`[N, J, 3, T]` 的 XYZ 关节序列
 - `text`：文本列表
@@ -62,56 +141,53 @@ python infer.py \
 
 ## 动态文本分段
 
-`--dynamic_text_path` 支持“一个动作里按时间切换多段文本”。
+`--dynamic_text_path` 用于在一段动作中按时间切换多段文本条件。
 
 - 文本文件每行一句
 - 每一行对应一个自回归窗口
-- 总时长会自动按 `行数 * pred_len / 20` 计算
-- 当前 DiP checkpoint 会自动走自回归，一般不需要再手动传 `--autoregressive`
+- 总时长自动按 `行数 * pred_len / 20` 计算
+- 对于带 `context_len/pred_len` 的 `ar_dit` checkpoint，会自动启用自回归模式，通常不需要再显式传入 `--autoregressive`
 
-示例 `asserts/prompts.txt`：
+示例 [assets/example_dynamic_text_prompts.txt](/home/wyc/motion-gen/assets/example_dynamic_text_prompts.txt)：
 
 ```txt
-a person stands still
-a person raises both arms
-a person waves both hands
-a person claps hands
-a person claps hands
-a person claps hands
-a person punches in the air
-a person punches in the air
-a person punches in the air
-a person twists the upper body left and right
-a person twists the upper body left and right
-a person twists the upper body left and right
-a person waves one hand
-a person waves one hand
-a person waves one hand
-a person waves one hand
+a person stands in place
+a person looks down and prepares to pick something up
+a person bends forward slowly
+a person bends lower and reaches the ground
+a person picks something up from the ground
+a person starts standing up
+a person rises with the object
+a person stands and holds the object
 ```
 
-推荐命令：
+示例命令：
 
 ```bash
 python infer.py \
-  --model_path save/dip/model000600343.pt \
-  --dynamic_text_path asserts/prompts.txt \
+  --model_path save/ar_ardit_cfg40_cosine600k_ctx_strongreg_genprefix_mid_steps6/model000550000.pt \
+  --dynamic_text_path assets/example_dynamic_text_prompts.txt \
   --out outputs/dynamic_blend.npy \
   --mp4_dir outputs/dynamic_blend_mp4
 ```
 
 ## 关键参数
 
-- `--guidance_param`：文本约束强度。大一些更贴文本，小一些通常更顺。
-- `--dynamic_text_blend`：窗口切换时，对前后文本条件做软过渡，范围 `0~1`。
-- `--autoregressive_motion_blend_frames`：窗口切换时，对前一段末尾和后一段开头做动作过渡的帧数。
+- `--guidance_param`：文本约束强度。数值越大，文本约束通常越强。
+- `--dynamic_text_blend`：窗口切换时前后文本条件的软过渡系数，范围 `0~1`。
+- `--autoregressive_motion_blend_frames`：窗口切换时前一段末尾与后一段开头的动作过渡帧数。
 - `--motion_length`：单句推理时的时长，单位秒。
-- `--mp4_dir`：填写后会额外导出 MP4。
+- `--mp4_dir`：指定后额外导出 MP4。
 
 ## 启动服务
 
+服务启动后提供：
+
+- `POST /generate`：一次性返回整段结果
+- `POST /generate_stream`：按 AR 分段流式返回
+
 ```bash
-bash serve/run_server.sh save/dip/model000600343.pt --port 8000 --device 0
+bash serve/run_server.sh save/ar_ardit_cfg40_cosine600k_ctx_strongreg_genprefix_mid_steps6/model000550000.pt --port 8000 --device 0
 ```
 
 一次性返回整段 `.npy`：
@@ -145,7 +221,7 @@ curl -X POST http://127.0.0.1:8000/generate \
 
 - 单句模式：按 `motion_length` 生成，多段返回
 - 多句模式：传 `texts`，一条句子对应一段
-- 当前 DiP checkpoint 里 `pred_len=40` 且 `fps=20`，默认一段 `2` 秒
+- 每段时长由 checkpoint 的 `pred_len` 和固定 `fps=20` 决定；例如 `pred_len=40` 时一段是 `2` 秒
 
 流式多句示例：
 
@@ -197,7 +273,7 @@ curl -N -X POST http://127.0.0.1:8000/generate_stream \
 ```bash
 python3 serve/test_stream_client.py \
   --url http://127.0.0.1:8000/generate_stream \
-  --texts_path asserts/prompts.txt \
+  --texts_path assets/example_dynamic_text_prompts.txt \
   --out_dir outputs/stream_client
 ```
 
@@ -247,5 +323,5 @@ python3 serve/benchmark_server.py \
   --base_url http://127.0.0.1:8000 \
   --mode stream \
   --runs 20 \
-  --texts_path asserts/prompts.txt
+  --texts_path assets/example_dynamic_text_prompts.txt
 ```

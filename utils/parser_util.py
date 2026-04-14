@@ -1,12 +1,19 @@
 """
 Brief:
-Define reusable argument-parsing helpers for the DiP-style inference path.
+Define reusable argument-parsing helpers for DDPM DiT / AR-DiT inference.
 """
 from argparse import ArgumentParser
 import argparse
 import json
 import os
 import sys
+
+
+DEFAULT_SAMPLING_STEPS = 50
+
+
+def default_guidance_for_arch(arch: str) -> float:
+    return 4.0 if arch == "ar_dit" else 2.5
 
 
 def _get_explicit_cli_dests(parser, candidate_dests, argv=None):
@@ -70,10 +77,23 @@ def load_args_from_model(args, args_to_overwrite, skip_overwrite_dests=None):
 
 
 def apply_rules(args):
+    if getattr(args, "layers", None) is None:
+        args.layers = 8
+    if getattr(args, "ff_size", None) is None:
+        args.ff_size = 1024
+    if getattr(args, "num_heads", None) is None:
+        args.num_heads = 4
+    if getattr(args, "dropout", None) is None:
+        args.dropout = 0.1
+
     if getattr(args, "pred_len", 0) == 0:
         args.pred_len = getattr(args, "context_len", 0)
     if getattr(args, "context_len", 0) > 0 and getattr(args, "pred_len", 0) > 0:
         args.autoregressive = True
+    if getattr(args, "autoregressive_init", "isaac") == "data":
+        args.autoregressive_init = "isaac"
+    if getattr(args, "guidance_param", None) is None:
+        args.guidance_param = default_guidance_for_arch(getattr(args, "arch", "dit"))
     return args
 
 
@@ -109,22 +129,23 @@ def add_diffusion_options(parser):
     group.add_argument("--noise_schedule", default="cosine", choices=["linear", "cosine"], type=str)
     group.add_argument("--diffusion_steps", default=1000, type=int)
     group.add_argument("--sigma_small", default=True, type=bool)
+    group.add_argument("--sampling_steps", default=DEFAULT_SAMPLING_STEPS, type=int)
 
 
 def add_model_options(parser):
     group = parser.add_argument_group("model")
-    group.add_argument("--arch", default="trans_dec", choices=["trans_dec"], type=str)
-    group.add_argument("--text_encoder_type", default="bert", choices=["bert"], type=str)
-    group.add_argument("--emb_trans_dec", action="store_true")
-    group.add_argument("--layers", default=8, type=int)
+    group.add_argument("--arch", default="dit", choices=["dit", "ar_dit"], type=str)
+    group.add_argument("--text_encoder_type", default="bert_clip", choices=["bert_clip"], type=str)
+    group.add_argument("--layers", default=None, type=int)
     group.add_argument("--model_dim", default=512, type=int)
+    group.add_argument("--ff_size", default=None, type=int)
+    group.add_argument("--num_heads", default=None, type=int)
+    group.add_argument("--dropout", default=None, type=float)
+    group.add_argument("--text_refiner_layers", default=2, type=int)
+    group.add_argument("--text_refiner_heads", default=4, type=int)
+    group.add_argument("--cache_text_embeddings", dest="cache_text_embeddings", action="store_true", default=False)
+    group.add_argument("--disable_text_embedding_cache", dest="cache_text_embeddings", action="store_false")
     group.add_argument("--cond_mask_prob", default=0.1, type=float)
-    group.add_argument(
-        "--mask_frames",
-        action="store_true",
-        default=True,
-        help="Mask invalid frames inside the transformer decoder.",
-    )
     group.add_argument("--lambda_rcxyz", default=0.0, type=float)
     group.add_argument("--lambda_vel", default=0.0, type=float)
     group.add_argument("--lambda_fc", default=0.0, type=float)
@@ -133,6 +154,9 @@ def add_model_options(parser):
     group.add_argument("--use_ema", action="store_true")
     group.add_argument("--context_len", default=0, type=int)
     group.add_argument("--pred_len", default=0, type=int)
+    group.add_argument("--enable_ar_dit_dual_cross_attn", dest="ar_dit_dual_cross_attn", action="store_true", default=False)
+    group.add_argument("--disable_ar_dit_dual_cross_attn", dest="ar_dit_dual_cross_attn", action="store_false")
+    group.add_argument("--unconstrained", action="store_true")
 
 
 def add_data_options(parser):
@@ -146,9 +170,10 @@ def add_sampling_options(parser):
     group.add_argument("--model_path", required=True, type=str)
     group.add_argument("--num_samples", default=1, type=int)
     group.add_argument("--num_repetitions", default=1, type=int)
-    group.add_argument("--guidance_param", default=7.5, type=float)
+    group.add_argument("--guidance_param", default=None, type=float)
     group.add_argument("--autoregressive", action="store_true")
     group.add_argument("--autoregressive_include_prefix", action="store_true")
+    group.add_argument("--autoregressive_init", default="isaac", choices=["data", "isaac"], type=str)
     group.add_argument("--autoregressive_motion_blend_frames", default=12, type=int)
 
 
@@ -159,8 +184,10 @@ def add_generate_options(parser):
     group.add_argument("--dynamic_text_path", default="", type=str)
     group.add_argument("--dynamic_text_blend", default=0.35, type=float)
     group.add_argument("--text_prompt", default="", type=str)
+    group.add_argument("--init_prefix_npy", default="", type=str)
 
 
 def get_cond_mode(args):
-    del args
+    if getattr(args, "unconstrained", False):
+        return "no_cond"
     return "text"

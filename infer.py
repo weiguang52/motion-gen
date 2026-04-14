@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 Brief:
-Run local DiP-style trans_dec inference and save decoded HumanML motions.
+Run local DDPM DiT / AR-DiT inference and save decoded HumanML motions.
 """
 import argparse
 import json
 import os
+import sys
 
 import numpy as np
 import torch
@@ -25,11 +26,20 @@ from utils.parser_util import (
     add_model_options,
     add_sampling_options,
     apply_rules,
+    default_guidance_for_arch,
     get_args_per_group_name,
     get_cond_mode,
     load_args_from_model,
 )
-from utils.sampler_util import AutoRegressiveSampler, ClassifierFreeSampleModel
+from utils.sampler_util import (
+    AutoRegressiveSampler,
+    ClassifierFreeSampleModel,
+    repeat_text_embed_for_dynamic,
+)
+
+
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+_DEFAULT_AR_DIT_INIT_PREFIX_NPY = os.path.join(_REPO_ROOT, "assets", "ar_dit_default_stand_prefix.npy")
 
 
 class _DummyData:
@@ -51,7 +61,7 @@ def _read_model_args(model_path: str) -> dict:
 
 
 def _build_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="DiP-style HumanML text inference (trans_dec only).")
+    parser = argparse.ArgumentParser(description="DDPM HumanML text inference for DiT / AR-DiT.")
     add_base_options(parser)
     add_sampling_options(parser)
     add_generate_options(parser)
@@ -80,12 +90,21 @@ def _build_args() -> argparse.Namespace:
     model_args = _read_model_args(args.model_path)
     if "autoregressive" in model_args:
         args.autoregressive = _coerce_bool(model_args["autoregressive"])
+    explicit_guidance = any(
+        token == "--guidance_param" or token.startswith("--guidance_param=")
+        for token in sys.argv[1:]
+    )
+    if not explicit_guidance and "gen_guidance_param" in model_args:
+        args.guidance_param = float(model_args["gen_guidance_param"])
 
     if args.force_use_ema:
         args.use_ema = True
     if args.cond_mask_prob == 0:
         args.guidance_param = 1
-    return apply_rules(args)
+    args = apply_rules(args)
+    if not explicit_guidance and "gen_guidance_param" not in model_args:
+        args.guidance_param = default_guidance_for_arch(args.arch)
+    return args
 
 
 def _resolve_data_root(args: argparse.Namespace) -> str:
@@ -94,10 +113,54 @@ def _resolve_data_root(args: argparse.Namespace) -> str:
     return "./dataset/HumanML3D"
 
 
-def _build_model_kwargs(model, args, texts, n_frames):
+def _resolve_init_prefix_npy(args: argparse.Namespace) -> str:
+    if getattr(args, "init_prefix_npy", ""):
+        return args.init_prefix_npy
+    if (
+        getattr(args, "arch", "") == "ar_dit"
+        and getattr(args, "autoregressive", False)
+        and int(getattr(args, "context_len", 0)) > 0
+        and getattr(args, "autoregressive_init", "isaac") == "isaac"
+    ):
+        return _DEFAULT_AR_DIT_INIT_PREFIX_NPY
+    return ""
+
+
+def _load_init_prefix_from_npy(path: str, mean: np.ndarray, std: np.ndarray, context_len: int, expected_dim: int):
+    if not path:
+        return None
+    if context_len <= 0:
+        raise SystemExit("init_prefix_npy requires context_len > 0.")
+    if not os.path.exists(path):
+        raise SystemExit(f"init_prefix_npy not found: {path}")
+
+    arr = np.load(path)
+    if arr.ndim != 2:
+        raise SystemExit(f"Expected init_prefix_npy shape [T, D], got {arr.shape}")
+    if arr.shape[1] != expected_dim:
+        raise SystemExit(f"Expected init_prefix_npy feature dim {expected_dim}, got {arr.shape[1]}")
+
+    prefix = torch.from_numpy(arr[:context_len]).float()
+    if prefix.shape[0] < context_len:
+        if prefix.shape[0] > 0:
+            pad = prefix[-1:].repeat(context_len - prefix.shape[0], 1)
+        else:
+            pad = torch.zeros(context_len, expected_dim)
+        prefix = torch.cat([prefix, pad], dim=0)
+
+    mean_t = torch.from_numpy(mean).float()
+    std_t = torch.from_numpy(std).float()
+    prefix = (prefix - mean_t) / std_t
+    return prefix.T.unsqueeze(1).contiguous()
+
+
+def _build_model_kwargs(model, args, texts, n_frames, mean, std):
     if args.context_len > 0:
         inp = torch.zeros(model.njoints, model.nfeats, args.pred_len)
-        prefix = torch.zeros(model.njoints, model.nfeats, args.context_len)
+        prefix_path = _resolve_init_prefix_npy(args)
+        prefix = _load_init_prefix_from_npy(prefix_path, mean, std, int(args.context_len), int(model.njoints))
+        if prefix is None:
+            prefix = torch.zeros(model.njoints, model.nfeats, args.context_len)
         collate_args = [{"inp": inp, "prefix": prefix, "lengths": args.pred_len}] * args.num_samples
     else:
         collate_args = [{"inp": torch.zeros(n_frames), "lengths": n_frames}] * args.num_samples
@@ -119,19 +182,13 @@ def _read_text_lines(path: str):
     return [line for line in lines if line]
 
 
-def _prepare_text_condition(model, args, texts, dynamic_texts, num_samples):
+def _prepare_text_condition(model, texts, dynamic_texts, num_samples):
     if dynamic_texts is None:
         text_embed = model.encode_text(texts)
         return texts, text_embed
 
     text_embed = model.encode_text(dynamic_texts)
-    return (
-        [list(dynamic_texts) for _ in range(num_samples)],
-        (
-            text_embed[0].permute(1, 0, 2).unsqueeze(0).repeat(num_samples, 1, 1, 1),
-            text_embed[1].unsqueeze(0).repeat(num_samples, 1, 1),
-        ),
-    )
+    return [list(dynamic_texts) for _ in range(num_samples)], repeat_text_embed_for_dynamic(text_embed, num_samples)
 
 
 def _expand_dynamic_caption(caption, length, pred_len):
@@ -162,6 +219,7 @@ def _resolve_target_frames(args, fps, max_frames, dynamic_texts):
 
 def main():
     args = _build_args()
+    fixseed(args.seed)
     dist_util.setup_dist(args.device)
     if not 0.0 <= args.dynamic_text_blend <= 1.0:
         raise SystemExit("dynamic_text_blend must be between 0 and 1.")
@@ -172,10 +230,12 @@ def main():
         raise SystemExit("Only text-conditioned models are supported.")
     if args.dataset != "humanml":
         raise SystemExit("Only HumanML checkpoints are supported in this script.")
-    if args.arch != "trans_dec":
-        raise SystemExit("Only trans_dec checkpoints are supported in this script.")
-    if args.text_encoder_type != "bert":
-        raise SystemExit("Only BERT text encoder is supported in this script.")
+    if args.arch not in {"dit", "ar_dit"}:
+        raise SystemExit(f"Only dit/ar_dit checkpoints are supported here, got arch={args.arch!r}.")
+    if args.text_encoder_type != "bert_clip":
+        raise SystemExit(f"Only bert_clip text encoder is supported, got {args.text_encoder_type!r}.")
+    if args.autoregressive and args.arch != "ar_dit":
+        raise SystemExit("Autoregressive sampling requires an ar_dit checkpoint.")
     if args.autoregressive and (args.context_len <= 0 or args.pred_len <= 0):
         raise SystemExit("Autoregressive sampling requires context_len > 0 and pred_len > 0.")
     if not args.text_prompt and not args.input_text and not args.dynamic_text_path:
@@ -204,6 +264,10 @@ def main():
 
     args.batch_size = args.num_samples
 
+    data_root = _resolve_data_root(args)
+    mean = np.load(os.path.join(data_root, "Mean.npy"))
+    std = np.load(os.path.join(data_root, "Std.npy"))
+
     print("Creating model and diffusion...")
     model, diffusion = create_model_and_diffusion(args, _DummyData())
 
@@ -215,21 +279,21 @@ def main():
     model.to(dist_util.dev())
     model.eval()
 
-    model_kwargs = _build_model_kwargs(model, args, texts, n_frames)
+    model_kwargs = _build_model_kwargs(model, args, texts, n_frames, mean, std)
     if args.guidance_param != 1:
         model_kwargs["y"]["scale"] = torch.ones(args.batch_size, device=dist_util.dev()) * args.guidance_param
     model_kwargs["y"]["text"], model_kwargs["y"]["text_embed"] = _prepare_text_condition(
         model,
-        args,
         model_kwargs["y"]["text"],
         dynamic_texts,
         args.num_samples,
     )
 
     def base_sample_fn(model_obj, shape, **sample_kwargs):
-        return diffusion.p_sample_loop(
+        return diffusion.logsnr_sample_loop(
             model_obj,
             shape,
+            steps=int(getattr(args, "sampling_steps", 50)),
             **sample_kwargs,
         )
 
@@ -244,10 +308,6 @@ def main():
     all_lengths = []
     all_text = []
 
-    data_root = _resolve_data_root(args)
-    mean = np.load(os.path.join(data_root, "Mean.npy"))
-    std = np.load(os.path.join(data_root, "Std.npy"))
-
     with torch.inference_mode():
         fixseed(args.seed)
         for rep_i in range(args.num_repetitions):
@@ -260,10 +320,9 @@ def main():
                 progress=True,
             )
 
-            n_joints = 22
             sample = sample.cpu().permute(0, 2, 3, 1)
             sample = sample * std + mean
-            sample = recover_from_ric(sample.float(), n_joints)
+            sample = recover_from_ric(sample.float(), 22)
             sample = sample.view(-1, *sample.shape[2:]).permute(0, 2, 3, 1)
 
             all_motions.append(sample.cpu().numpy())
@@ -321,9 +380,11 @@ def main():
                     dataset=args.dataset,
                     fps=fps,
                 )
-                clip.write_videofile(save_path, fps=fps, threads=4, logger=None)
-                clip.close()
-        print("MP4 rendering complete.")
+                if clip is not None:
+                    clip.write_videofile(save_path, fps=fps, threads=4, logger=None)
+                    clip.close()
+
+        print(f"Saved MP4 files to {mp4_dir}")
 
 
 if __name__ == "__main__":

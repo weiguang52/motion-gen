@@ -7,7 +7,8 @@ Usage:
   bash serve/run_server.sh /path/to/model.pt [--host 0.0.0.0] [--port 8000] [--workers 1] [--device 0] [--log-level info]
 
 Example:
-  bash serve/run_server.sh ../save/humanml_trans_dec_512_bert/model000200000.pt --port 9000 --device 0
+  bash serve/run_server.sh save/dit/model000200000.pt --port 9000 --device 0
+  bash serve/run_server.sh save/ar_dit/model000200000.pt --port 8000 --device 0
 USAGE
 }
 

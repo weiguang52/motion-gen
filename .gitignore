@@ -146,3 +146,4 @@ language_models/
 *.npy
 *.txt
 *.mp4
+.codex

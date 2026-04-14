@@ -1,12 +1,14 @@
 # This code is based on https://github.com/openai/guided-diffusion
 """
-Minimal DDPM inference utilities for trans_dec motion generation.
+Minimal DDPM inference utilities for DiT / AR-DiT motion generation.
 """
 import enum
 import math
 
 import numpy as np
 import torch as th
+
+from diffusion.spacing import build_spaced_timesteps
 
 
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps, scale_betas=1.0):
@@ -135,13 +137,18 @@ class GaussianDiffusion:
             return t.float() * (1000.0 / self.num_timesteps)
         return t
 
+    def _continuous_model_timestep(self, t):
+        if t.is_floating_point():
+            return t.to(dtype=th.float32).clamp(0.0, 1.0)
+        return t.to(dtype=th.float32) / float(max(self.num_timesteps - 1, 1))
+
     def p_mean_variance(self, model, x, t, clip_denoised=True, denoised_fn=None, model_kwargs=None):
         if model_kwargs is None:
             model_kwargs = {}
 
         batch_size, channels = x.shape[:2]
         assert t.shape == (batch_size,)
-        model_output = model(x, self._scale_timesteps(t), **model_kwargs)
+        model_output = model(x, self._continuous_model_timestep(t), **model_kwargs)
 
         if self.model_var_type == ModelVarType.FIXED_LARGE:
             model_variance = np.append(self.posterior_variance[1], self.betas[1:])
@@ -206,7 +213,12 @@ class GaussianDiffusion:
         progress=False,
     ):
         final = None
-        if model_kwargs is not None and "y" in model_kwargs and "text" in model_kwargs["y"]:
+        if (
+            model_kwargs is not None
+            and "y" in model_kwargs
+            and "text" in model_kwargs["y"]
+            and "text_embed" not in model_kwargs["y"]
+        ):
             model_kwargs["y"]["text_embed"] = model.encode_text(model_kwargs["y"]["text"])
 
         for sample in self.p_sample_loop_progressive(
@@ -221,6 +233,54 @@ class GaussianDiffusion:
         ):
             final = sample
         return final["sample"]
+
+    def logsnr_sample_loop(
+        self,
+        model,
+        shape,
+        noise=None,
+        clip_denoised=True,
+        denoised_fn=None,
+        model_kwargs=None,
+        device=None,
+        progress=False,
+        steps=100,
+    ):
+        if device is None:
+            device = next(model.parameters()).device
+        if model_kwargs is None:
+            model_kwargs = {}
+
+        if "y" in model_kwargs and "text" in model_kwargs["y"]:
+            model_kwargs["y"]["text_embed"] = model.encode_text(model_kwargs["y"]["text"])
+
+        use_timesteps = build_spaced_timesteps(
+            self.num_timesteps,
+            steps,
+            spacing="logsnr",
+            betas=self.betas,
+        )
+
+        from diffusion.respace import SpacedDiffusion
+
+        eval_diffusion = SpacedDiffusion(
+            use_timesteps=use_timesteps,
+            betas=self.betas,
+            model_mean_type=self.model_mean_type,
+            model_var_type=self.model_var_type,
+            loss_type=LossType.MSE,
+            rescale_timesteps=self.rescale_timesteps,
+        )
+        return eval_diffusion.p_sample_loop(
+            model,
+            shape,
+            noise=noise,
+            clip_denoised=clip_denoised,
+            denoised_fn=denoised_fn,
+            model_kwargs=model_kwargs,
+            device=device,
+            progress=progress,
+        )
 
     def p_sample_loop_progressive(
         self,

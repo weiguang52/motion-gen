@@ -1,6 +1,6 @@
 """
 Brief:
-Create the trans_dec model, configure DDPM sampling, and load checkpoints.
+Create DiT / AR-DiT models, configure DDPM sampling, and load checkpoints.
 """
 import inspect
 
@@ -11,27 +11,98 @@ from model.mdm import MDM
 from utils.parser_util import get_cond_mode
 
 
-def _remap_text_encoder_state_dict(state_dict):
+def _uses_ar_dit_dual_cross_attn_keys(state_dict):
+    return any(".cross_attn_text." in key for key in state_dict.keys())
+
+
+def checkpoint_uses_ar_dit_dual_cross_attn(model_path):
+    checkpoint = torch.load(model_path, map_location="cpu")
+    if isinstance(checkpoint, dict):
+        if "model_avg" in checkpoint:
+            checkpoint = checkpoint["model_avg"]
+        elif "model" in checkpoint:
+            checkpoint = checkpoint["model"]
+    return _uses_ar_dit_dual_cross_attn_keys(checkpoint)
+
+
+def _upgrade_ar_dit_dual_cross_attn_state_dict(model, state_dict):
+    expected_keys = set(model.state_dict().keys())
+    if not any(".cross_attn_text." in key for key in expected_keys):
+        return state_dict
+
+    upgraded = dict(state_dict)
+    for old_key in list(state_dict.keys()):
+        new_keys = []
+        if ".cross_attn." in old_key:
+            new_keys = [
+                old_key.replace(".cross_attn.", ".cross_attn_text."),
+                old_key.replace(".cross_attn.", ".cross_attn_prefix."),
+            ]
+        elif ".cross_norm." in old_key:
+            new_keys = [
+                old_key.replace(".cross_norm.", ".cross_norm_text."),
+                old_key.replace(".cross_norm.", ".cross_norm_prefix."),
+            ]
+        elif ".adaLN_modulation.1.weight" in old_key or ".adaLN_modulation.1.bias" in old_key:
+            old_tensor = state_dict[old_key]
+            if old_tensor.shape[0] % 9 != 0:
+                continue
+            chunk_size = old_tensor.shape[0] // 9
+            chunks = old_tensor.split(chunk_size, dim=0)
+            expanded = torch.cat([*chunks[:6], *chunks[6:9], *chunks[6:9]], dim=0)
+            if expanded.shape != model.state_dict().get(old_key, expanded).shape:
+                continue
+            upgraded[old_key] = expanded
+            continue
+        if not new_keys:
+            continue
+        if not all(new_key in expected_keys for new_key in new_keys):
+            continue
+        for new_key in new_keys:
+            upgraded.setdefault(new_key, state_dict[old_key].clone())
+        del upgraded[old_key]
+    return upgraded
+
+
+def _remap_legacy_text_encoder_state_dict(state_dict):
     remapped = {}
     for key, value in state_dict.items():
         new_key = key
         if key.startswith("bert_text_model."):
-            new_key = "clip_model." + key[len("bert_text_model."):]
+            new_key = "text_conditioner.bert_text_model." + key[len("bert_text_model."):]
         elif key.startswith("bert_model."):
-            new_key = "clip_model." + key[len("bert_model."):]
+            new_key = "text_conditioner.bert_text_model." + key[len("bert_model."):]
+        elif key.startswith("clip_model."):
+            new_key = "text_conditioner.bert_text_model." + key[len("clip_model."):]
         remapped[new_key] = value
     return remapped
 
 
 def load_model_wo_clip(model, state_dict):
+    model_expects_dual = _uses_ar_dit_dual_cross_attn_keys(model.state_dict())
+    checkpoint_uses_dual = _uses_ar_dit_dual_cross_attn_keys(state_dict)
     state_dict = dict(state_dict)
     state_dict.pop("sequence_pos_encoder.pe", None)
     state_dict.pop("embed_timestep.sequence_pos_encoder.pe", None)
-    state_dict = _remap_text_encoder_state_dict(state_dict)
+    state_dict = _remap_legacy_text_encoder_state_dict(state_dict)
+
+    if model_expects_dual and not checkpoint_uses_dual:
+        state_dict = _upgrade_ar_dit_dual_cross_attn_state_dict(model, state_dict)
+    elif checkpoint_uses_dual and not model_expects_dual:
+        raise ValueError(
+            "Checkpoint uses AR-DiT dual cross-attention weights, but the current model was built "
+            "without dual cross-attention. Enable --enable_ar_dit_dual_cross_attn for this checkpoint."
+        )
 
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
     assert len(unexpected_keys) == 0
-    allowed_missing_prefixes = ("clip_model.", "bert_text_model.", "bert_model.")
+    allowed_missing_prefixes = (
+        "text_conditioner.bert_text_model.",
+        "text_conditioner.clip_text_model.",
+        "clip_model.",
+        "bert_text_model.",
+        "bert_model.",
+    )
     assert all(
         key.startswith(allowed_missing_prefixes)
         or "sequence_pos_encoder" in key
@@ -59,34 +130,35 @@ def get_model_args(args):
     if not hasattr(args, "context_len"):
         args.context_len = 0
 
-    emb_policy = args.__dict__.get("emb_policy", "add")
     return {
-        "modeltype": "",
         "njoints": 263,
         "nfeats": 1,
         "translation": True,
         "pose_rep": "rot6d",
         "glob": True,
-        "glob_rot": True,
         "model_dim": args.model_dim,
-        "ff_size": 1024,
+        "ff_size": args.ff_size,
         "num_layers": args.layers,
-        "num_heads": 4,
-        "dropout": 0.1,
+        "num_heads": args.num_heads,
+        "dropout": args.dropout,
         "activation": "gelu",
         "data_rep": "hml_vec",
         "cond_mode": cond_mode,
         "cond_mask_prob": args.cond_mask_prob,
         "arch": args.arch,
-        "emb_trans_dec": args.emb_trans_dec,
         "clip_version": clip_version,
         "dataset": args.dataset,
         "text_encoder_type": args.text_encoder_type,
+        "text_refiner_layers": getattr(args, "text_refiner_layers", 2),
+        "text_refiner_heads": getattr(args, "text_refiner_heads", 4),
+        "cache_text_embeddings": getattr(args, "cache_text_embeddings", False),
+        "time_embed_mode": "ddpm",
+        "diffusion_steps": args.diffusion_steps,
+        "rescale_timesteps": False,
         "pos_embed_max_len": args.pos_embed_max_len,
-        "mask_frames": args.mask_frames,
         "pred_len": args.pred_len,
         "context_len": args.context_len,
-        "emb_policy": emb_policy,
+        "ar_dit_dual_cross_attn": getattr(args, "ar_dit_dual_cross_attn", False),
     }
 
 
