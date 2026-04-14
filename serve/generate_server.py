@@ -37,7 +37,6 @@ from utils.parser_util import (
     apply_rules,
     default_guidance_for_arch,
     get_args_per_group_name,
-    get_cond_mode,
     load_args_from_model,
 )
 from utils.sampler_util import (
@@ -275,10 +274,6 @@ def _init_state() -> ServerState:
         raise RuntimeError(f"Only HumanML is supported, got dataset={args.dataset!r}.")
     if args.arch not in {"dit", "ar_dit"}:
         raise RuntimeError(f"Only dit/ar_dit are supported here, got arch={args.arch!r}.")
-    if args.text_encoder_type != "bert_clip":
-        raise RuntimeError(f"Only bert_clip text encoder is supported, got {args.text_encoder_type!r}.")
-    if get_cond_mode(args) != "text":
-        raise RuntimeError("Only text-conditioned models are supported.")
     if args.autoregressive and args.arch != "ar_dit":
         raise RuntimeError("Autoregressive serving requires an ar_dit checkpoint.")
     if args.autoregressive_motion_blend_frames < 0:

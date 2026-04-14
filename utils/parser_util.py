@@ -2,11 +2,9 @@
 Brief:
 Define reusable argument-parsing helpers for DDPM DiT / AR-DiT inference.
 """
-from argparse import ArgumentParser
 import argparse
 import json
 import os
-import sys
 
 
 DEFAULT_SAMPLING_STEPS = 50
@@ -14,50 +12,6 @@ DEFAULT_SAMPLING_STEPS = 50
 
 def default_guidance_for_arch(arch: str) -> float:
     return 4.0 if arch == "ar_dit" else 2.5
-
-
-def _get_explicit_cli_dests(parser, candidate_dests, argv=None):
-    if argv is None:
-        argv = sys.argv[1:]
-    if not candidate_dests:
-        return set()
-
-    option_to_dest = {}
-    candidate_dests = set(candidate_dests)
-    for action in parser._actions:
-        if action.dest in candidate_dests:
-            for option in action.option_strings:
-                option_to_dest[option] = action.dest
-
-    explicit = set()
-    for token in argv:
-        if not token.startswith("-"):
-            continue
-        option = token.split("=", 1)[0]
-        dest = option_to_dest.get(option)
-        if dest is not None:
-            explicit.add(dest)
-    return explicit
-
-
-def parse_and_load_from_model(parser, preserve_cli=None):
-    add_data_options(parser)
-    add_model_options(parser)
-    add_diffusion_options(parser)
-    args = parser.parse_args()
-    cli_override_dests = _get_explicit_cli_dests(parser, preserve_cli)
-    args_to_overwrite = []
-    for group_name in ["dataset", "model", "diffusion"]:
-        args_to_overwrite += get_args_per_group_name(parser, args, group_name)
-    if args.model_path != "":
-        args = load_args_from_model(
-            args,
-            args_to_overwrite,
-            skip_overwrite_dests=cli_override_dests,
-        )
-    if args.cond_mask_prob == 0:
-        args.guidance_param = 1
-    return apply_rules(args)
 
 
 def load_args_from_model(args, args_to_overwrite, skip_overwrite_dests=None):
@@ -102,17 +56,7 @@ def get_args_per_group_name(parser, args, group_name):
         if group.title == group_name:
             group_dict = {a.dest: getattr(args, a.dest, None) for a in group._group_actions}
             return list(argparse.Namespace(**group_dict).__dict__.keys())
-    return ValueError("group_name was not found.")
-
-
-def get_model_path_from_args():
-    try:
-        dummy_parser = ArgumentParser()
-        dummy_parser.add_argument("--model_path")
-        dummy_args, _ = dummy_parser.parse_known_args()
-        return dummy_args.model_path
-    except Exception as exc:
-        raise ValueError("model_path argument must be specified.") from exc
+    raise ValueError("group_name was not found.")
 
 
 def add_base_options(parser):
@@ -135,7 +79,6 @@ def add_diffusion_options(parser):
 def add_model_options(parser):
     group = parser.add_argument_group("model")
     group.add_argument("--arch", default="dit", choices=["dit", "ar_dit"], type=str)
-    group.add_argument("--text_encoder_type", default="bert_clip", choices=["bert_clip"], type=str)
     group.add_argument("--layers", default=None, type=int)
     group.add_argument("--model_dim", default=512, type=int)
     group.add_argument("--ff_size", default=None, type=int)
@@ -154,9 +97,6 @@ def add_model_options(parser):
     group.add_argument("--use_ema", action="store_true")
     group.add_argument("--context_len", default=0, type=int)
     group.add_argument("--pred_len", default=0, type=int)
-    group.add_argument("--enable_ar_dit_dual_cross_attn", dest="ar_dit_dual_cross_attn", action="store_true", default=False)
-    group.add_argument("--disable_ar_dit_dual_cross_attn", dest="ar_dit_dual_cross_attn", action="store_false")
-    group.add_argument("--unconstrained", action="store_true")
 
 
 def add_data_options(parser):
@@ -185,9 +125,3 @@ def add_generate_options(parser):
     group.add_argument("--dynamic_text_blend", default=0.35, type=float)
     group.add_argument("--text_prompt", default="", type=str)
     group.add_argument("--init_prefix_npy", default="", type=str)
-
-
-def get_cond_mode(args):
-    if getattr(args, "unconstrained", False):
-        return "no_cond"
-    return "text"

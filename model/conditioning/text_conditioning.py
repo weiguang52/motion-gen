@@ -16,15 +16,7 @@ def _resolve_language_model_root():
     env_root = os.environ.get("TEXT2MOTION_LM_ROOT")
     if env_root:
         return Path(env_root)
-
-    candidates = [
-        _REPO_ROOT / "language_models",
-        _REPO_ROOT.parent / "motion-diffusion-model" / "language_models",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return candidates[0]
+    return _REPO_ROOT / "language_models"
 
 
 _LANGUAGE_MODEL_ROOT = _resolve_language_model_root()
@@ -33,18 +25,7 @@ _DEFAULT_BERT_MODEL_PATH = (
     str(_LOCAL_BERT_MODEL_PATH) if _LOCAL_BERT_MODEL_PATH.exists() else "distilbert/distilbert-base-uncased"
 )
 _LOCAL_CLIP_B32 = _LANGUAGE_MODEL_ROOT / "clip-vit-base-patch32"
-
-_CLIP_VERSION_MAP = {
-    "ViT-B/32": str(_LOCAL_CLIP_B32) if _LOCAL_CLIP_B32.exists() else "openai/clip-vit-base-patch32",
-    "ViT-B/16": "openai/clip-vit-base-patch16",
-    "ViT-L/14": "openai/clip-vit-large-patch14",
-    "ViT-L/14@336px": "openai/clip-vit-large-patch14-336",
-    "RN50": "openai/clip-rn50",
-    "RN101": "openai/clip-rn101",
-    "RN50x4": "openai/clip-rn50x4",
-    "RN50x16": "openai/clip-rn50x16",
-    "RN50x64": "openai/clip-rn50x64",
-}
+_CLIP_B32_MODEL_ID = str(_LOCAL_CLIP_B32) if _LOCAL_CLIP_B32.exists() else "openai/clip-vit-base-patch32"
 
 
 class FrozenBERTTextEncoder(nn.Module):
@@ -74,15 +55,7 @@ def load_bert(model_path):
 
 
 def unpack_text_embed(enc_text):
-    if isinstance(enc_text, dict):
-        ctxt = enc_text.get("ctxt", enc_text.get("context_tokens"))
-        ctxt_mask = enc_text.get("ctxt_mask", enc_text.get("context_mask"))
-        vtxt = enc_text.get("vtxt", enc_text.get("global_text"))
-        return ctxt, ctxt_mask, vtxt
-    if isinstance(enc_text, tuple):
-        ctxt, ctxt_mask = enc_text
-        return ctxt, ctxt_mask, None
-    return None, None, enc_text
+    return enc_text["ctxt"], enc_text["ctxt_mask"], enc_text["vtxt"]
 
 
 class TextConditionEncoder(nn.Module):
@@ -113,23 +86,15 @@ class TextConditionEncoder(nn.Module):
 
     @staticmethod
     def _infer_clip_dim(clip_model):
-        if hasattr(clip_model, "config"):
-            if hasattr(clip_model.config, "projection_dim"):
-                return clip_model.config.projection_dim
-            if hasattr(clip_model.config, "hidden_size"):
-                return clip_model.config.hidden_size
-        raise ValueError("Failed to infer CLIP embedding dimension from model config.")
+        return clip_model.config.projection_dim
 
     @staticmethod
     def _load_frozen_clip(clip_version):
         from transformers import CLIPTextModelWithProjection, CLIPTokenizer
 
-        model_id = _CLIP_VERSION_MAP.get(clip_version, clip_version)
-        if ("/" not in model_id) and (not Path(model_id).exists()) and clip_version not in _CLIP_VERSION_MAP:
-            raise ValueError(
-                f"Unknown CLIP version '{clip_version}'. "
-                "Use a Hugging Face model id, e.g. 'openai/clip-vit-base-patch32'."
-            )
+        if clip_version != "ViT-B/32":
+            raise ValueError(f"Unsupported CLIP version: {clip_version!r}")
+        model_id = _CLIP_B32_MODEL_ID
         tokenizer = CLIPTokenizer.from_pretrained(model_id)
         clip_model = CLIPTextModelWithProjection.from_pretrained(model_id)
         clip_model.eval()

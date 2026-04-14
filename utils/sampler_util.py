@@ -8,108 +8,40 @@ from copy import deepcopy
 from utils.wrapper_util import wrapped_getattr
 
 
-def _get_text_embed_item(text_embed, new_key, legacy_key):
-    if new_key in text_embed:
-        return text_embed[new_key]
-    return text_embed.get(legacy_key)
-
-
 def repeat_text_embed_for_dynamic(text_embed, num_samples):
-    if isinstance(text_embed, dict):
-        repeated = {}
-        ctxt = _get_text_embed_item(text_embed, 'ctxt', 'context_tokens')
-        ctxt_mask = _get_text_embed_item(text_embed, 'ctxt_mask', 'context_mask')
-        vtxt = _get_text_embed_item(text_embed, 'vtxt', 'global_text')
-        if ctxt is not None:
-            repeated['ctxt'] = ctxt.unsqueeze(0).repeat(num_samples, 1, 1, 1)
-        if ctxt_mask is not None:
-            repeated['ctxt_mask'] = ctxt_mask.unsqueeze(0).repeat(num_samples, 1, 1)
-        if vtxt is not None:
-            repeated['vtxt'] = vtxt.unsqueeze(0).repeat(num_samples, 1, 1, 1)
-        return repeated
-    return (
-        text_embed[0].unsqueeze(0).repeat(num_samples, 1, 1, 1),
-        text_embed[1].unsqueeze(0).repeat(num_samples, 1, 1),
-    )
-
-
-def select_dynamic_text_embed_step(text_embed, step_idx):
-    if isinstance(text_embed, dict):
-        step_embed = {}
-        ctxt = _get_text_embed_item(text_embed, 'ctxt', 'context_tokens')
-        ctxt_mask = _get_text_embed_item(text_embed, 'ctxt_mask', 'context_mask')
-        vtxt = _get_text_embed_item(text_embed, 'vtxt', 'global_text')
-        if ctxt is not None:
-            step_embed['ctxt'] = ctxt[:, :, step_idx]
-        if ctxt_mask is not None:
-            step_embed['ctxt_mask'] = ctxt_mask[:, step_idx]
-        if vtxt is not None:
-            step_embed['vtxt'] = vtxt[:, :, step_idx]
-        return step_embed
-    return (
-        text_embed[0][:, :, step_idx],
-        text_embed[1][:, step_idx],
-    )
+    return {
+        'ctxt': text_embed['ctxt'].unsqueeze(0).repeat(num_samples, 1, 1, 1),
+        'ctxt_mask': text_embed['ctxt_mask'].unsqueeze(0).repeat(num_samples, 1, 1),
+        'vtxt': text_embed['vtxt'].unsqueeze(0).repeat(num_samples, 1, 1, 1),
+    }
 
 
 def select_dynamic_text_embed_indices(text_embed, step_indices):
-    if isinstance(text_embed, dict):
-        step_embed = {}
-        ctxt = _get_text_embed_item(text_embed, 'ctxt', 'context_tokens')
-        ctxt_mask = _get_text_embed_item(text_embed, 'ctxt_mask', 'context_mask')
-        vtxt = _get_text_embed_item(text_embed, 'vtxt', 'global_text')
-        if ctxt is not None:
-            step_embed['ctxt'] = torch.stack(
-                [ctxt[sample_i, :, idx] for sample_i, idx in enumerate(step_indices)],
-                dim=1,
-            )
-        if ctxt_mask is not None:
-            step_embed['ctxt_mask'] = torch.stack(
-                [ctxt_mask[sample_i, idx] for sample_i, idx in enumerate(step_indices)],
-                dim=0,
-            )
-        if vtxt is not None:
-            step_embed['vtxt'] = torch.stack(
-                [vtxt[sample_i, :, idx] for sample_i, idx in enumerate(step_indices)],
-                dim=1,
-            )
-        return step_embed
-    return (
-        torch.stack(
-            [text_embed[0][sample_i, :, idx] for sample_i, idx in enumerate(step_indices)],
+    return {
+        'ctxt': torch.stack(
+            [text_embed['ctxt'][sample_i, :, idx] for sample_i, idx in enumerate(step_indices)],
             dim=1,
         ),
-        torch.stack(
-            [text_embed[1][sample_i, idx] for sample_i, idx in enumerate(step_indices)],
+        'ctxt_mask': torch.stack(
+            [text_embed['ctxt_mask'][sample_i, idx] for sample_i, idx in enumerate(step_indices)],
             dim=0,
         ),
-    )
+        'vtxt': torch.stack(
+            [text_embed['vtxt'][sample_i, :, idx] for sample_i, idx in enumerate(step_indices)],
+            dim=1,
+        ),
+    }
 
 
 def blend_dynamic_text_embed(prev_embed, cur_embed, blend):
     blend = max(0.0, min(1.0, float(blend)))
     if blend == 0.0:
         return cur_embed
-    if isinstance(cur_embed, dict):
-        mixed = dict(cur_embed)
-        prev_ctxt = _get_text_embed_item(prev_embed, 'ctxt', 'context_tokens')
-        cur_ctxt = _get_text_embed_item(cur_embed, 'ctxt', 'context_tokens')
-        prev_mask = _get_text_embed_item(prev_embed, 'ctxt_mask', 'context_mask')
-        cur_mask = _get_text_embed_item(cur_embed, 'ctxt_mask', 'context_mask')
-        prev_vtxt = _get_text_embed_item(prev_embed, 'vtxt', 'global_text')
-        cur_vtxt = _get_text_embed_item(cur_embed, 'vtxt', 'global_text')
-        if prev_ctxt is not None and cur_ctxt is not None:
-            mixed['ctxt'] = (blend * prev_ctxt) + ((1.0 - blend) * cur_ctxt)
-        if prev_mask is not None and cur_mask is not None:
-            mixed['ctxt_mask'] = cur_mask if blend < 0.5 else (cur_mask & prev_mask)
-        if prev_vtxt is not None and cur_vtxt is not None:
-            mixed['vtxt'] = (blend * prev_vtxt) + ((1.0 - blend) * cur_vtxt)
-        return mixed
-    prev_tokens, prev_mask = prev_embed
-    cur_tokens, cur_mask = cur_embed
-    mixed_tokens = (blend * prev_tokens) + ((1.0 - blend) * cur_tokens)
-    mixed_mask = cur_mask if blend < 0.5 else (cur_mask & prev_mask)
-    return mixed_tokens, mixed_mask
+    return {
+        'ctxt': (blend * prev_embed['ctxt']) + ((1.0 - blend) * cur_embed['ctxt']),
+        'ctxt_mask': cur_embed['ctxt_mask'] if blend < 0.5 else (cur_embed['ctxt_mask'] & prev_embed['ctxt_mask']),
+        'vtxt': (blend * prev_embed['vtxt']) + ((1.0 - blend) * cur_embed['vtxt']),
+    }
 
 
 # A wrapper model for Classifier-free guidance **SAMPLING** only
@@ -132,8 +64,7 @@ class ClassifierFreeSampleModel(nn.Module):
         self.encode_text = self.model.encode_text
 
     def forward(self, x, timesteps, y=None):
-        cond_mode = self.model.cond_mode
-        assert cond_mode in ['text', 'no_cond']
+        assert self.model.cond_mode == 'text'
         y_uncond = deepcopy(y)
         y_uncond['uncond'] = True
         out = self.model(x, timesteps, y)
@@ -182,10 +113,6 @@ class AutoRegressiveSampler():
                 seg_idx = [min(i, len(s) - 1) for s in kargs['model_kwargs']['y']['text']]
                 cur_text = [s[idx] for s, idx in zip(kargs['model_kwargs']['y']['text'], seg_idx)]
                 cur_kargs['model_kwargs']['y']['text'] = cur_text
-                if model.text_encoder_type != 'bert_clip':
-                    raise NotImplementedError(
-                        'Dynamic text sampling currently supports only bert_clip text encoders.'
-                    )
                 text_embed = cur_kargs['model_kwargs']['y']['text_embed']
                 cur_embed = select_dynamic_text_embed_indices(text_embed, seg_idx)
                 blend = float(getattr(self.args, 'dynamic_text_blend', 0.0) or 0.0)

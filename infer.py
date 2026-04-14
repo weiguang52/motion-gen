@@ -28,7 +28,6 @@ from utils.parser_util import (
     apply_rules,
     default_guidance_for_arch,
     get_args_per_group_name,
-    get_cond_mode,
     load_args_from_model,
 )
 from utils.sampler_util import (
@@ -226,14 +225,10 @@ def main():
     if args.autoregressive_motion_blend_frames < 0:
         raise SystemExit("autoregressive_motion_blend_frames must be >= 0.")
 
-    if get_cond_mode(args) != "text":
-        raise SystemExit("Only text-conditioned models are supported.")
     if args.dataset != "humanml":
         raise SystemExit("Only HumanML checkpoints are supported in this script.")
     if args.arch not in {"dit", "ar_dit"}:
         raise SystemExit(f"Only dit/ar_dit checkpoints are supported here, got arch={args.arch!r}.")
-    if args.text_encoder_type != "bert_clip":
-        raise SystemExit(f"Only bert_clip text encoder is supported, got {args.text_encoder_type!r}.")
     if args.autoregressive and args.arch != "ar_dit":
         raise SystemExit("Autoregressive sampling requires an ar_dit checkpoint.")
     if args.autoregressive and (args.context_len <= 0 or args.pred_len <= 0):

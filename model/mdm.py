@@ -49,10 +49,9 @@ class MDM(nn.Module):
         self.activation = activation
         self.input_feats = self.njoints * self.nfeats
 
-        self.cond_mode = kargs.get('cond_mode', 'no_cond')
+        self.cond_mode = 'text'
         self.cond_mask_prob = kargs.get('cond_mask_prob', 0.1)
         self.arch = arch
-        self.ar_dit_dual_cross_attn = bool(kargs.get('ar_dit_dual_cross_attn', False))
         self.input_process = InputProcess(self.data_rep, self.input_feats, self.model_dim)
 
         self.sequence_pos_encoder = PositionalEncoding(self.model_dim, self.dropout, max_len=kargs.get('pos_embed_max_len', 5000))
@@ -86,23 +85,6 @@ class MDM(nn.Module):
 
         self.rot2xyz = Rotation2xyz(device='cpu', dataset=self.dataset)
 
-    def parameters_wo_clip(self):
-        # Kept for backward compatibility with existing call sites.
-        return [p for name, p in self.named_parameters() if not self._is_language_parameter_name(name)]
-
-    @staticmethod
-    def _is_language_parameter_name(name):
-        # Exclude language backbones (CLIP/BERT), including legacy attribute prefixes.
-        return (
-            name.startswith('clip_text_model.')
-            or name.startswith('clip_model.')
-            or name.startswith('global_clip_model.')
-            or name.startswith('bert_text_model.')
-            or name.startswith('bert_model.')
-            or name.startswith('text_conditioner.clip_text_model.')
-            or name.startswith('text_conditioner.bert_text_model.')
-        )
-
     def _init_target_cond(self):
         if self.multi_target_cond:
             if self.multi_encoder_type == 'multi':
@@ -113,16 +95,7 @@ class MDM(nn.Module):
                 self.embed_target_cond = EmbedTargetLocSplit(self.all_goal_joint_names, self.model_dim, self.target_enc_layers)
 
     def _init_backbone(self, kargs):
-        if self.arch == 'trans_dec':
-            print("TRANS_DEC init")
-            seqTransDecoderLayer = nn.TransformerDecoderLayer(d_model=self.model_dim,
-                                                              nhead=self.num_heads,
-                                                              dim_feedforward=self.ff_size,
-                                                              dropout=self.dropout,
-                                                              activation=self.activation)
-            self.seqTransDecoder = nn.TransformerDecoder(seqTransDecoderLayer,
-                                                         num_layers=self.num_layers)
-        elif self.arch == 'dit':
+        if self.arch == 'dit':
             print("DiT init")
             self.seqDiT = MotionDiT(
                 hidden_size=self.model_dim,
@@ -139,10 +112,9 @@ class MDM(nn.Module):
                 depth=self.num_layers,
                 num_heads=self.num_heads,
                 dropout=self.dropout,
-                use_dual_cross_attn=self.ar_dit_dual_cross_attn,
             )
         else:
-            raise ValueError('Please choose correct architecture [trans_dec, dit, ar_dit]')
+            raise ValueError('Please choose correct architecture [dit, ar_dit]')
 
     def _init_conditioning(self, kargs, clip_version):
         self.text_conditioning.init_conditioning(kargs, clip_version)
@@ -195,11 +167,10 @@ class MDM(nn.Module):
                                        y['mask']], dim=-1)
         return x
 
-    def _build_cond_emb(self, time_emb, y, bs):
+    def _build_text_condition(self, time_emb, y):
         return self.text_conditioning.build_condition_embeddings(
             time_emb,
             y,
-            bs,
             mask_cond_fn=self.mask_cond,
         )
 
@@ -221,19 +192,8 @@ class MDM(nn.Module):
     def _compose_cross_context(self, text_emb, text_mask, prefix_context, prefix_mask):
         return compose_cross_context(text_emb, text_mask, prefix_context, prefix_mask)
 
-    def _forward_trans_dec(self, x, cond_emb, frames_mask, text_mask):
-        xseq = x
-        xseq = self.sequence_pos_encoder(xseq)
-        output = self.seqTransDecoder(
-            tgt=xseq,
-            memory=cond_emb,
-            memory_key_padding_mask=text_mask,
-            tgt_key_padding_mask=frames_mask,
-        )  # Rotem's bug fix
-        return output
-
-    def _build_transformer_condition_vector(self, global_cond, text_emb, text_mask, text_global_emb):
-        cond_vec = self._compute_dit_condition(global_cond, None)
+    def _build_transformer_condition_vector(self, time_emb, text_emb, text_mask, text_global_emb):
+        cond_vec = self._compute_dit_condition(time_emb, None)
         if text_global_emb is not None:
             pooled_text = self._compute_dit_condition(text_global_emb, None)
             cond_vec = cond_vec + pooled_text
@@ -256,11 +216,10 @@ class MDM(nn.Module):
             return None, None
         return text_emb.permute(1, 0, 2), text_mask
 
-    def _forward_dit(self, x, cond_emb, global_cond, frames_mask, text_mask, text_emb, text_global_emb):
-        del cond_emb
+    def _forward_dit(self, x, time_emb, frames_mask, text_mask, text_emb, text_global_emb):
         xseq = x
         xseq = self.sequence_pos_encoder(xseq)
-        cond_vec = self._build_transformer_condition_vector(global_cond, text_emb, text_mask, text_global_emb)
+        cond_vec = self._build_transformer_condition_vector(time_emb, text_emb, text_mask, text_global_emb)
         ctx, ctx_mask = self._build_transformer_context(text_emb, text_mask)
 
         output = self.seqDiT(xseq, cond_vec, key_padding_mask=frames_mask, context=ctx, context_mask=ctx_mask)
@@ -269,8 +228,7 @@ class MDM(nn.Module):
     def _forward_ar_dit(
         self,
         x,
-        cond_emb,
-        global_cond,
+        time_emb,
         frames_mask,
         text_mask,
         text_emb,
@@ -278,36 +236,23 @@ class MDM(nn.Module):
         prefix_context,
         prefix_mask,
     ):
-        del cond_emb
         xseq = x
         xseq = self.sequence_pos_encoder(xseq)
-        cond_vec = self._build_transformer_condition_vector(global_cond, text_emb, text_mask, text_global_emb)
-        if self.ar_dit_dual_cross_attn:
-            text_ctx, text_ctx_mask = self._build_transformer_context(text_emb, text_mask)
-            output = self.seqDiT(
-                xseq,
-                cond_vec,
-                key_padding_mask=frames_mask,
-                text_context=text_ctx,
-                text_context_mask=text_ctx_mask,
-                prefix_context=prefix_context,
-                prefix_context_mask=prefix_mask,
-            )
-        else:
-            ctx, ctx_mask = self._build_transformer_context(
-                text_emb,
-                text_mask,
-                prefix_context=prefix_context,
-                prefix_mask=prefix_mask,
-                include_prefix=True,
-            )
-            output = self.seqDiT(
-                xseq,
-                cond_vec,
-                key_padding_mask=frames_mask,
-                context=ctx,
-                context_mask=ctx_mask,
-            )
+        cond_vec = self._build_transformer_condition_vector(time_emb, text_emb, text_mask, text_global_emb)
+        ctx, ctx_mask = self._build_transformer_context(
+            text_emb,
+            text_mask,
+            prefix_context=prefix_context,
+            prefix_mask=prefix_mask,
+            include_prefix=True,
+        )
+        output = self.seqDiT(
+            xseq,
+            cond_vec,
+            key_padding_mask=frames_mask,
+            context=ctx,
+            context_mask=ctx_mask,
+        )
         return output
 
     def forward(self, x, timesteps, y=None):
@@ -320,25 +265,21 @@ class MDM(nn.Module):
 
         time_emb = self._apply_target_cond(time_emb, y)
         x = self._apply_prefix_completion(x, y, bs)
-        cond_emb, text_emb, text_mask, global_cond, text_global_emb = self._build_cond_emb(time_emb, y, bs)
+        text_emb, text_mask, text_global_emb = self._build_text_condition(time_emb, y)
         prefix_context, prefix_mask = self._build_prefix_context(y)
 
         x = self.input_process(x)
 
         frames_mask = self._build_frames_mask(y, x)
 
-        if self.arch == 'trans_dec':
-            output = self._forward_trans_dec(x, cond_emb, frames_mask, text_mask)
-
-        elif self.arch == 'dit':
+        if self.arch == 'dit':
             output = self._forward_dit(
-                x, cond_emb, global_cond, frames_mask, text_mask, text_emb, text_global_emb
+                x, time_emb, frames_mask, text_mask, text_emb, text_global_emb
             )
         elif self.arch == 'ar_dit':
             output = self._forward_ar_dit(
                 x,
-                cond_emb,
-                global_cond,
+                time_emb,
                 frames_mask,
                 text_mask,
                 text_emb,
