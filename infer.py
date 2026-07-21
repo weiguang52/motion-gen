@@ -38,7 +38,7 @@ from utils.sampler_util import (
 
 
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
-_DEFAULT_AR_DIT_INIT_PREFIX_NPY = os.path.join(_REPO_ROOT, "assets", "ar_dit_default_stand_prefix.npy")
+_DEFAULT_AR_DIT_INIT_PREFIX_NPY = os.path.join(_REPO_ROOT, "assets", "ar_dit_zero_vel_stand_prefix.npy")
 
 
 class _DummyData:

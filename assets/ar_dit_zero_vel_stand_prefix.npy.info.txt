@@ -1,0 +1,9 @@
+mode: mean_pose_zero_velocity
+source: Mean.npy
+start: -1
+score: -1.0
+context_len: 20
+shape: (20, 263)
+root_vel_mean_abs: 0.0
+joint_vel_mean_abs: 0.0
+foot_contact_mean: 1.0
