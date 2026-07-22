@@ -120,8 +120,32 @@ def add_sampling_options(parser):
 def add_generate_options(parser):
     group = parser.add_argument_group("generate")
     group.add_argument("--motion_length", default=9.8, type=float)
+    group.add_argument(
+        "--num_frames",
+        default=0,
+        type=int,
+        help="Exact number of new frames to return; overrides motion_length when greater than zero.",
+    )
     group.add_argument("--input_text", default="", type=str)
     group.add_argument("--dynamic_text_path", default="", type=str)
     group.add_argument("--dynamic_text_blend", default=0.35, type=float)
     group.add_argument("--text_prompt", default="", type=str)
     group.add_argument("--init_prefix_npy", default="", type=str)
+    group.add_argument(
+        "--continuation_npy",
+        default="",
+        type=str,
+        help="Previous infer.py result containing hml_vec; its final frames are fixed as a DiT prefix.",
+    )
+    group.add_argument(
+        "--continuation_prefix_frames",
+        default=20,
+        type=int,
+        help="Number of final frames from continuation_npy to use as the fixed DiT prefix.",
+    )
+    group.add_argument(
+        "--continuation_blend_frames",
+        default=12,
+        type=int,
+        help="Number of new frames used to fade boundary state/velocity correction back to the DiT sample.",
+    )

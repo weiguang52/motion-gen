@@ -63,6 +63,33 @@ python infer.py \
 - `outputs/sample.npy`
 - `outputs/sample_mp4/sample00_rep00.mp4`
 
+### 4.1 DiT 固定前缀续写
+
+普通 `dit` 支持用上一段结果的最后若干帧续写。第一次生成 60 帧：
+
+```bash
+python infer.py \
+  --model_path save/ddpm263bert_clip_refiner_dit/model000600000.pt \
+  --text_prompt "a person walks forward" \
+  --num_frames 60 \
+  --out outputs/segment_01.npy
+```
+
+第二次生成 80 个新帧，并把第一段最后 20 帧作为固定前缀：
+
+```bash
+python infer.py \
+  --model_path save/ddpm263bert_clip_refiner_dit/model000600000.pt \
+  --text_prompt "a person raises both hands" \
+  --num_frames 80 \
+  --continuation_npy outputs/segment_01.npy \
+  --continuation_prefix_frames 20 \
+  --continuation_blend_frames 12 \
+  --out outputs/segment_02.npy
+```
+
+内部实际采样长度为 `20 + 80 = 100` 帧。扩散过程中前 20 帧始终由已知动作约束，结束后丢弃，只在结果中返回新生成的 80 帧。新段开头默认用 12 帧平滑状态和速度边界，并继承上一段根位置与朝向。`continuation_npy` 必须包含 `hml_vec`；新版 `infer.py` 还会保存 `decode_state` 供后续连续解码。旧版结果没有 `decode_state` 时会从 `hml_vec` 自动重建。
+
 ### 5. 动态文本推理示例
 
 `ar_dit` 用于分段自回归生成：
@@ -135,6 +162,7 @@ python infer.py \
 输出的 `.npy` 为一个字典：
 
 - `motion`：`[N, J, 3, T]` 的 XYZ 关节序列
+- `hml_vec`：`[N, T, 263]` 的 HumanML 表示，可作为下一次 DiT 续写输入
 - `text`：文本列表
 - `lengths`：每个样本的帧数
 - `fps`：固定为 `20`
@@ -177,6 +205,10 @@ python infer.py \
 - `--dynamic_text_blend`：窗口切换时前后文本条件的软过渡系数，范围 `0~1`。
 - `--autoregressive_motion_blend_frames`：窗口切换时前一段末尾与后一段开头的动作过渡帧数。
 - `--motion_length`：单句推理时的时长，单位秒。
+- `--num_frames`：精确指定返回的新动作帧数，设置后覆盖 `--motion_length`。
+- `--continuation_npy`：上一段 `infer.py` 输出，用于普通 DiT 固定前缀续写。
+- `--continuation_prefix_frames`：从上一段末尾取多少帧作为前缀，默认 `20`。
+- `--continuation_blend_frames`：新动作开头用于平滑状态和速度边界的帧数，默认 `12`；设为 `0` 可关闭。
 - `--mp4_dir`：指定后额外导出 MP4。
 
 ## 启动服务
@@ -198,6 +230,24 @@ curl -X POST http://127.0.0.1:8000/generate \
   -d '{"text":"a person waves both hands"}' \
   --output results.npy
 ```
+
+使用普通 DiT 服务时，`POST /generate` 会按 `session_id` 自动保存上一段动作。下面先生成 60 帧，再用其最后 20 帧约束第二次生成的 80 个新帧：
+
+```bash
+bash serve/run_server.sh save/ddpm263bert_clip_refiner_dit/model000600000.pt --port 8000 --device 0
+
+curl -X POST http://127.0.0.1:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{"text":"a person walks forward","num_frames":60,"session_id":"demo","reset_session":true}' \
+  --output segment_01.npy
+
+curl -X POST http://127.0.0.1:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{"text":"a person raises both hands","num_frames":80,"session_id":"demo","prefix_frames":20,"blend_frames":12}' \
+  --output segment_02.npy
+```
+
+同一 `session_id` 的第二次及后续请求默认 `continue_from_previous=true`。不同客户端应使用不同的 `session_id`；需要从头生成时传 `reset_session=true` 或 `continue_from_previous=false`。服务端默认前缀长度和平滑长度可分别通过环境变量 `MDM_CONTINUATION_PREFIX_FRAMES`、`MDM_CONTINUATION_BLEND_FRAMES` 修改。普通 DiT 的“前缀帧 + 新帧”总长度不能超过 196。
 
 服务端也支持多句分段输入，字段名是 `texts`：
 

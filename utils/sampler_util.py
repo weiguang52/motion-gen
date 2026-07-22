@@ -44,6 +44,46 @@ def blend_dynamic_text_embed(prev_embed, cur_embed, blend):
     }
 
 
+def smooth_continuation_boundary(prefix, suffix, blend_frames):
+    """Match the new HumanML segment to the prefix, then fade back to the sampled suffix."""
+    prefix = prefix.to(device=suffix.device, dtype=suffix.dtype)
+    blend_frames = min(int(blend_frames), prefix.shape[-1], suffix.shape[-1])
+    if blend_frames <= 0:
+        return suffix
+    if prefix.shape[:-1] != suffix.shape[:-1]:
+        raise ValueError("prefix and suffix must have matching batch and feature dimensions.")
+
+    last_frame = prefix[..., -1:]
+    target_first = last_frame.clone()
+    if prefix.shape[-1] >= 2:
+        previous_frame = prefix[..., -2:-1]
+        state_end = min(193, prefix.shape[1])
+        if state_end > 3:
+            # Root height, relative joint positions and rotations are state-like.
+            # Continue their final one-frame trend at the first generated frame.
+            target_first[:, 3:state_end] += (
+                last_frame[:, 3:state_end] - previous_frame[:, 3:state_end]
+            )
+
+    correction = target_first - suffix[..., :1]
+    if blend_frames == 1:
+        weights = torch.ones(1, device=suffix.device, dtype=suffix.dtype)
+    else:
+        phase = torch.linspace(
+            0.0,
+            torch.pi,
+            blend_frames,
+            device=suffix.device,
+            dtype=suffix.dtype,
+        )
+        weights = 0.5 * (1.0 + torch.cos(phase))
+    weights = weights.view(1, 1, 1, blend_frames)
+
+    smoothed = suffix.clone()
+    smoothed[..., :blend_frames] += correction * weights
+    return smoothed
+
+
 # A wrapper model for Classifier-free guidance **SAMPLING** only
 # https://arxiv.org/abs/2207.12598
 class ClassifierFreeSampleModel(nn.Module):

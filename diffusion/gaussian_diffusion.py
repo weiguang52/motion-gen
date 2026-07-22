@@ -84,6 +84,8 @@ class GaussianDiffusion:
         self.alphas_cumprod = np.cumprod(alphas, axis=0)
         self.alphas_cumprod_prev = np.append(1.0, self.alphas_cumprod[:-1])
 
+        self.sqrt_alphas_cumprod = np.sqrt(self.alphas_cumprod)
+        self.sqrt_one_minus_alphas_cumprod = np.sqrt(1.0 - self.alphas_cumprod)
         self.sqrt_recip_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod)
         self.sqrt_recipm1_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod - 1)
 
@@ -114,6 +116,15 @@ class GaussianDiffusion:
             x_t.shape,
         )
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
+
+    def q_sample(self, x_start, t, noise=None):
+        """Diffuse a clean sample to timestep ``t``."""
+        if noise is None:
+            noise = th.randn_like(x_start)
+        return (
+            _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
+            + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+        )
 
     def _predict_xstart_from_eps(self, x_t, t, eps):
         return (
@@ -211,6 +222,8 @@ class GaussianDiffusion:
         model_kwargs=None,
         device=None,
         progress=False,
+        known_motion=None,
+        known_mask=None,
     ):
         final = None
         if (
@@ -230,6 +243,8 @@ class GaussianDiffusion:
             model_kwargs=model_kwargs,
             device=device,
             progress=progress,
+            known_motion=known_motion,
+            known_mask=known_mask,
         ):
             final = sample
         return final["sample"]
@@ -245,6 +260,8 @@ class GaussianDiffusion:
         device=None,
         progress=False,
         steps=100,
+        known_motion=None,
+        known_mask=None,
     ):
         if device is None:
             device = next(model.parameters()).device
@@ -280,6 +297,8 @@ class GaussianDiffusion:
             model_kwargs=model_kwargs,
             device=device,
             progress=progress,
+            known_motion=known_motion,
+            known_mask=known_mask,
         )
 
     def p_sample_loop_progressive(
@@ -292,11 +311,29 @@ class GaussianDiffusion:
         model_kwargs=None,
         device=None,
         progress=False,
+        known_motion=None,
+        known_mask=None,
     ):
         if device is None:
             device = next(model.parameters()).device
         assert isinstance(shape, (tuple, list))
         img = noise if noise is not None else th.randn(*shape, device=device)
+
+        if (known_motion is None) != (known_mask is None):
+            raise ValueError("known_motion and known_mask must be provided together.")
+
+        known_noise = None
+        if known_motion is not None:
+            known_motion = known_motion.to(device=device, dtype=img.dtype)
+            known_mask = known_mask.to(device=device, dtype=th.bool)
+            try:
+                known_motion = known_motion.expand(*shape)
+                known_mask = known_mask.expand(*shape)
+            except RuntimeError as exc:
+                raise ValueError(
+                    f"known_motion and known_mask must broadcast to sample shape {tuple(shape)}."
+                ) from exc
+            known_noise = th.randn_like(known_motion)
 
         indices = list(range(self.num_timesteps))[::-1]
         if progress:
@@ -307,6 +344,9 @@ class GaussianDiffusion:
         for i in indices:
             t = th.tensor([i] * shape[0], device=device)
             with th.no_grad():
+                if known_motion is not None:
+                    known_at_t = self.q_sample(known_motion, t, noise=known_noise)
+                    img = th.where(known_mask, known_at_t, img)
                 out = self.p_sample(
                     model,
                     img,
@@ -315,6 +355,14 @@ class GaussianDiffusion:
                     denoised_fn=denoised_fn,
                     model_kwargs=model_kwargs,
                 )
+                if known_motion is not None:
+                    if i == 0:
+                        known_next = known_motion
+                    else:
+                        next_t = th.tensor([i - 1] * shape[0], device=device)
+                        known_next = self.q_sample(known_motion, next_t, noise=known_noise)
+                    out["sample"] = th.where(known_mask, known_next, out["sample"])
+                    out["pred_xstart"] = th.where(known_mask, known_motion, out["pred_xstart"])
                 yield out
                 img = out["sample"]
 

@@ -9,7 +9,7 @@ import json
 import os
 import threading
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -22,7 +22,7 @@ try:
 except ImportError:  # pragma: no cover
     ConfigDict = None
 
-from data_loaders.humanml.scripts.motion_process import recover_from_ric, recover_from_ric_stateful
+from data_loaders.humanml.scripts.motion_process import recover_from_ric_stateful
 from data_loaders.tensors import collate
 from utils import dist_util
 from utils.fixseed import fixseed
@@ -43,6 +43,7 @@ from utils.sampler_util import (
     AutoRegressiveSampler,
     ClassifierFreeSampleModel,
     repeat_text_embed_for_dynamic,
+    smooth_continuation_boundary,
 )
 
 
@@ -66,6 +67,35 @@ class GenerateRequest(BaseModel):
         gt=0,
         description="Optional motion length in seconds. If omitted, uses the model default.",
     )
+    num_frames: Optional[int] = Field(
+        None,
+        gt=0,
+        description="Exact number of new frames to return; overrides motion_length.",
+    )
+    session_id: str = Field(
+        "default",
+        min_length=1,
+        max_length=128,
+        description="Continuation state is isolated by this identifier.",
+    )
+    continue_from_previous: bool = Field(
+        True,
+        description="For plain DiT, use the previous result in this session as a fixed prefix.",
+    )
+    reset_session: bool = Field(
+        False,
+        description="Discard the previous result before generating this request.",
+    )
+    prefix_frames: Optional[int] = Field(
+        None,
+        gt=0,
+        description="Override the server's fixed-prefix frame count for this request.",
+    )
+    blend_frames: Optional[int] = Field(
+        None,
+        ge=0,
+        description="Override the number of new frames used for boundary smoothing.",
+    )
 
     if ConfigDict is not None:
         model_config = ConfigDict(extra="forbid")
@@ -85,6 +115,10 @@ class ServerState:
     max_frames: int
     fps: float
     lock: threading.Lock
+    continuation_prefix_frames: int
+    continuation_blend_frames: int
+    session_motions: Dict[str, torch.Tensor]
+    session_decode_states: Dict[str, Dict[str, torch.Tensor]]
 
 
 class _DummyData:
@@ -172,6 +206,20 @@ def _load_init_prefix_from_npy(path: str, mean: np.ndarray, std: np.ndarray, con
     std_t = torch.from_numpy(std).float()
     prefix = (prefix - mean_t) / std_t
     return prefix.T.unsqueeze(1).contiguous()
+
+
+def _build_known_prefix(prefix: torch.Tensor, total_frames: int, device):
+    prefix = prefix.to(device)
+    prefix_len = prefix.shape[-1]
+    known_motion = torch.zeros(
+        prefix.shape[0], prefix.shape[1], prefix.shape[2], total_frames,
+        dtype=prefix.dtype,
+        device=device,
+    )
+    known_motion[..., :prefix_len] = prefix
+    known_mask = torch.zeros_like(known_motion, dtype=torch.bool)
+    known_mask[..., :prefix_len] = True
+    return known_motion, known_mask
 
 
 def _build_model_kwargs(state: ServerState, args: argparse.Namespace, texts, n_frames):
@@ -281,6 +329,13 @@ def _init_state() -> ServerState:
     if args.autoregressive and (args.context_len <= 0 or args.pred_len <= 0):
         raise RuntimeError("Autoregressive sampling requires context_len > 0 and pred_len > 0.")
 
+    continuation_prefix_frames = int(os.environ.get("MDM_CONTINUATION_PREFIX_FRAMES", "20"))
+    if continuation_prefix_frames <= 0:
+        raise RuntimeError("MDM_CONTINUATION_PREFIX_FRAMES must be greater than zero.")
+    continuation_blend_frames = int(os.environ.get("MDM_CONTINUATION_BLEND_FRAMES", "12"))
+    if continuation_blend_frames < 0:
+        raise RuntimeError("MDM_CONTINUATION_BLEND_FRAMES must be >= 0.")
+
     max_frames = 196
     fps = 20
 
@@ -308,6 +363,10 @@ def _init_state() -> ServerState:
         max_frames=max_frames,
         fps=fps,
         lock=threading.Lock(),
+        continuation_prefix_frames=continuation_prefix_frames,
+        continuation_blend_frames=continuation_blend_frames,
+        session_motions={},
+        session_decode_states={},
     )
 
 
@@ -322,13 +381,47 @@ def _sample(state: ServerState, req: GenerateRequest) -> bytes:
         if not args.autoregressive:
             raise HTTPException(status_code=400, detail="texts requires an autoregressive checkpoint.")
         n_frames = len(dynamic_texts) * args.pred_len
+    elif req.num_frames is not None:
+        n_frames = req.num_frames
     else:
         motion_length = req.motion_length if req.motion_length is not None else args.motion_length
         n_frames = _resolve_target_frames(args, state.fps, state.max_frames, motion_length)
     if n_frames <= 0:
         raise HTTPException(status_code=400, detail="motion_length too small for current FPS.")
 
+    continuation_prefix = None
+    continuation_decode_state = None
+    prefix_frames = 0
+    blend_frames = 0
+    if args.arch == "dit":
+        if req.reset_session:
+            state.session_motions.pop(req.session_id, None)
+            state.session_decode_states.pop(req.session_id, None)
+        if req.continue_from_previous:
+            previous_motion = state.session_motions.get(req.session_id)
+            if previous_motion is not None:
+                requested_prefix_frames = req.prefix_frames or state.continuation_prefix_frames
+                prefix_frames = min(requested_prefix_frames, previous_motion.shape[-1])
+                continuation_prefix = previous_motion[..., -prefix_frames:]
+                continuation_decode_state = state.session_decode_states.get(req.session_id)
+                requested_blend_frames = (
+                    state.continuation_blend_frames
+                    if req.blend_frames is None
+                    else req.blend_frames
+                )
+                blend_frames = min(requested_blend_frames, n_frames)
+
+        if n_frames + prefix_frames > state.max_frames:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Requested {n_frames} new frames plus {prefix_frames} prefix frames, "
+                    f"but this DiT supports at most {state.max_frames} total frames."
+                ),
+            )
+
     args.batch_size = args.num_samples
+    total_frames = n_frames + prefix_frames
 
     def base_sample_fn(model, shape, **sample_kwargs):
         return state.diffusion.logsnr_sample_loop(
@@ -349,7 +442,7 @@ def _sample(state: ServerState, req: GenerateRequest) -> bytes:
     else:
         model_to_use = state.model
 
-    model_kwargs = _build_model_kwargs(state, args, texts, n_frames)
+    model_kwargs = _build_model_kwargs(state, args, texts, total_frames)
     if args.guidance_param != 1:
         model_kwargs["y"]["scale"] = torch.ones(args.batch_size, device=dist_util.dev()) * args.guidance_param
     model_kwargs["y"]["text"], model_kwargs["y"]["text_embed"] = _prepare_text_condition(
@@ -359,8 +452,16 @@ def _sample(state: ServerState, req: GenerateRequest) -> bytes:
         args.num_samples,
     )
 
-    sample_frames = n_frames if args.autoregressive or args.context_len == 0 else args.pred_len
+    sample_frames = total_frames if args.autoregressive or args.context_len == 0 else args.pred_len
     motion_shape = (args.batch_size, state.model.njoints, state.model.nfeats, sample_frames)
+    inpaint_kwargs = {}
+    if continuation_prefix is not None:
+        known_motion, known_mask = _build_known_prefix(
+            continuation_prefix,
+            sample_frames,
+            dist_util.dev(),
+        )
+        inpaint_kwargs = {"known_motion": known_motion, "known_mask": known_mask}
 
     with torch.inference_mode():
         fixseed(args.seed)
@@ -370,14 +471,33 @@ def _sample(state: ServerState, req: GenerateRequest) -> bytes:
             clip_denoised=False,
             model_kwargs=model_kwargs,
             progress=False,
+            **inpaint_kwargs,
         )
-        motions, hml_vec = _decode_motion_batch(sample, state.mean, state.std)
+        if prefix_frames:
+            sample = smooth_continuation_boundary(
+                continuation_prefix,
+                sample[..., prefix_frames:],
+                blend_frames,
+            )
+        if args.arch == "dit":
+            state.session_motions[req.session_id] = sample.detach().cpu()
+        motions, hml_vec, next_decode_state = _decode_motion_batch_stateful(
+            sample,
+            state.mean,
+            state.std,
+            decode_state=continuation_decode_state,
+        )
+        if args.arch == "dit":
+            state.session_decode_states[req.session_id] = {
+                key: value.detach().cpu()
+                for key, value in next_decode_state.items()
+            }
         if args.autoregressive:
             lengths = np.full((args.batch_size,), n_frames, dtype=np.int64)
         elif args.context_len > 0:
             lengths = np.full((args.batch_size,), motions.shape[-1], dtype=np.int64)
         else:
-            lengths = model_kwargs["y"]["lengths"].cpu().numpy()
+            lengths = np.full((args.batch_size,), n_frames, dtype=np.int64)
 
     results = {
         "motion": motions[: args.num_samples],
@@ -387,6 +507,13 @@ def _sample(state: ServerState, req: GenerateRequest) -> bytes:
         "fps": state.fps,
         "num_samples": args.num_samples,
         "num_repetitions": args.num_repetitions,
+        "session_id": req.session_id,
+        "continuation_prefix_frames": prefix_frames,
+        "continuation_blend_frames": blend_frames,
+        "decode_state": {
+            key: value.cpu().numpy()
+            for key, value in next_decode_state.items()
+        },
     }
 
     buf = io.BytesIO()
@@ -401,12 +528,21 @@ def _denormalize_hml_vec(sample: torch.Tensor, mean: np.ndarray, std: np.ndarray
     return (sample * std_t) + mean_t
 
 
-def _decode_motion_batch(sample: torch.Tensor, mean: np.ndarray, std: np.ndarray):
+def _decode_motion_batch_stateful(
+    sample: torch.Tensor,
+    mean: np.ndarray,
+    std: np.ndarray,
+    decode_state=None,
+):
     hml_vec = _denormalize_hml_vec(sample, mean, std)
-    motion = recover_from_ric(hml_vec.float(), 22)
+    motion, next_decode_state = recover_from_ric_stateful(
+        hml_vec.float(),
+        22,
+        state=decode_state,
+    )
     motion = motion.view(-1, *motion.shape[2:]).permute(0, 2, 3, 1)
     hml_vec = hml_vec.squeeze(1).permute(0, 2, 1)
-    return motion.cpu().numpy(), hml_vec.cpu().numpy()
+    return motion.cpu().numpy(), hml_vec.cpu().numpy(), next_decode_state
 
 
 def _decode_hml_vec_chunk_stateful(hml_vec_chunk: torch.Tensor, state=None):
