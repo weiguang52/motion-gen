@@ -72,6 +72,8 @@ class GenerateRequest(BaseModel):
         gt=0,
         description="Exact number of new frames to return; overrides motion_length.",
     )
+    lookahead_frames: Optional[int] = Field(None, ge=0)
+    is_final: bool = False
     session_id: str = Field(
         "default",
         min_length=1,
@@ -389,6 +391,9 @@ def _sample(state: ServerState, req: GenerateRequest) -> bytes:
     if n_frames <= 0:
         raise HTTPException(status_code=400, detail="motion_length too small for current FPS.")
 
+    lookahead_frames = 0 if req.is_final else (req.lookahead_frames if req.lookahead_frames is not None else int(os.environ.get("MDM_CONTINUATION_LOOKAHEAD_FRAMES", "0")))
+    if lookahead_frames < 0 or (lookahead_frames and args.arch != "dit"):
+        raise HTTPException(status_code=400, detail="lookahead requires plain dit and nonnegative frames")
     continuation_prefix = None
     continuation_decode_state = None
     prefix_frames = 0
@@ -411,7 +416,7 @@ def _sample(state: ServerState, req: GenerateRequest) -> bytes:
                 )
                 blend_frames = min(requested_blend_frames, n_frames)
 
-        if n_frames + prefix_frames > state.max_frames:
+        if n_frames + prefix_frames + lookahead_frames > state.max_frames:
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -421,7 +426,7 @@ def _sample(state: ServerState, req: GenerateRequest) -> bytes:
             )
 
     args.batch_size = args.num_samples
-    total_frames = n_frames + prefix_frames
+    total_frames = n_frames + prefix_frames + lookahead_frames
 
     def base_sample_fn(model, shape, **sample_kwargs):
         return state.diffusion.logsnr_sample_loop(
@@ -473,6 +478,8 @@ def _sample(state: ServerState, req: GenerateRequest) -> bytes:
             progress=False,
             **inpaint_kwargs,
         )
+        if args.arch == "dit":
+            sample = sample[..., :prefix_frames + n_frames]
         if prefix_frames:
             sample = smooth_continuation_boundary(
                 continuation_prefix,
@@ -508,6 +515,7 @@ def _sample(state: ServerState, req: GenerateRequest) -> bytes:
         "num_samples": args.num_samples,
         "num_repetitions": args.num_repetitions,
         "session_id": req.session_id,
+        "continuation_lookahead_frames": lookahead_frames,
         "continuation_prefix_frames": prefix_frames,
         "continuation_blend_frames": blend_frames,
         "decode_state": {

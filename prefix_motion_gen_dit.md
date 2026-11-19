@@ -295,3 +295,8 @@ python -m py_compile \
 - 不希望继续上一段：传 `"continue_from_previous": false`；希望同时清掉旧状态则再传 `"reset_session": true`。
 - 边界仍偏硬：适当增加 `blend_frames` / `continuation_blend_frames`，但不能超过新段帧数；也可以设为 `0` 对比关闭平滑后的效果。
 - 想使用多句动态文本或流式逐段输出：应启动 `ar_dit` checkpoint 并使用 `/generate_stream`，不属于本文的普通 DiT 固定前缀方案。
+
+
+## 实验性前瞻尾帧
+
+CLI新增 `--continuation_lookahead_frames`（默认0）与 `--continuation_is_final`。服务新增 `lookahead_frames`、`is_final` 及默认值环境变量 `MDM_CONTINUATION_LOOKAHEAD_FRAMES`。仅普通DiT使用。采样P+N+L不超过196；在平滑、解码和保存会话之前丢弃尾帧，仅返回N帧。末段强制L0。较长前缀不能超过已实际返回历史。默认保持原行为；尚未通过最终动作质量验收。CLI的 `--continuation_repaint_repeats` 仅用于消融，默认1。

@@ -68,6 +68,9 @@ def _build_args() -> argparse.Namespace:
     add_data_options(parser)
     add_model_options(parser)
     add_diffusion_options(parser)
+    parser.add_argument("--continuation_repaint_repeats", type=int, default=1)
+    parser.add_argument("--continuation_lookahead_frames", type=int, default=0)
+    parser.add_argument("--continuation_is_final", action="store_true")
     parser.add_argument("--out", default="outputs/sample.npy", type=str, help="Output .npy path.")
     parser.add_argument(
         "--force_use_ema",
@@ -374,7 +377,10 @@ def main():
         args.batch_size,
     )
     prefix_frames = 0 if continuation_prefix is None else continuation_prefix.shape[-1]
-    sample_frames = n_frames + prefix_frames
+    lookahead_frames = 0 if args.continuation_is_final else args.continuation_lookahead_frames
+    if lookahead_frames < 0 or (lookahead_frames and args.arch != "dit"):
+        raise SystemExit("lookahead requires plain dit and nonnegative frames")
+    sample_frames = n_frames + prefix_frames + lookahead_frames
     if not args.autoregressive and sample_frames > max_frames:
         raise SystemExit(
             f"Requested {n_frames} new frames plus {prefix_frames} prefix frames, "
@@ -407,6 +413,7 @@ def main():
             model_obj,
             shape,
             steps=int(getattr(args, "sampling_steps", 50)),
+            repaint_repeats=args.continuation_repaint_repeats,
             **sample_kwargs,
         )
 
@@ -448,6 +455,8 @@ def main():
                 **inpaint_kwargs,
             )
 
+            if args.arch == "dit":
+                sample = sample[..., :prefix_frames + n_frames]
             if prefix_frames:
                 suffix = sample[..., prefix_frames:]
                 sample = smooth_continuation_boundary(
@@ -494,6 +503,7 @@ def main():
         "num_samples": args.num_samples,
         "num_repetitions": args.num_repetitions,
         "model_path": args.model_path,
+        "continuation_lookahead_frames": lookahead_frames,
         "continuation_prefix_frames": prefix_frames,
         "continuation_blend_frames": min(args.continuation_blend_frames, n_frames) if prefix_frames else 0,
         "decode_state": {

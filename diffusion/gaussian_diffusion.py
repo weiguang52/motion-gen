@@ -224,6 +224,7 @@ class GaussianDiffusion:
         progress=False,
         known_motion=None,
         known_mask=None,
+        repaint_repeats=1,
     ):
         final = None
         if (
@@ -245,6 +246,7 @@ class GaussianDiffusion:
             progress=progress,
             known_motion=known_motion,
             known_mask=known_mask,
+            repaint_repeats=repaint_repeats,
         ):
             final = sample
         return final["sample"]
@@ -262,6 +264,7 @@ class GaussianDiffusion:
         steps=100,
         known_motion=None,
         known_mask=None,
+        repaint_repeats=1,
     ):
         if device is None:
             device = next(model.parameters()).device
@@ -299,6 +302,7 @@ class GaussianDiffusion:
             progress=progress,
             known_motion=known_motion,
             known_mask=known_mask,
+            repaint_repeats=repaint_repeats,
         )
 
     def p_sample_loop_progressive(
@@ -313,6 +317,7 @@ class GaussianDiffusion:
         progress=False,
         known_motion=None,
         known_mask=None,
+        repaint_repeats=1,
     ):
         if device is None:
             device = next(model.parameters()).device
@@ -355,6 +360,13 @@ class GaussianDiffusion:
                     denoised_fn=denoised_fn,
                     model_kwargs=model_kwargs,
                 )
+                if known_motion is not None and i >= self.num_timesteps // 2 and i > 0:
+                    for _ in range(max(0, int(repaint_repeats) - 1)):
+                        # Forward one spaced diffusion step, then denoise again.
+                        alpha = float(self.alphas_cumprod[i] / self.alphas_cumprod[i - 1])
+                        img = out["sample"] * (alpha ** 0.5) + th.randn_like(img) * ((1 - alpha) ** 0.5)
+                        img = th.where(known_mask, self.q_sample(known_motion, t, noise=known_noise), img)
+                        out = self.p_sample(model, img, t, clip_denoised=clip_denoised, denoised_fn=denoised_fn, model_kwargs=model_kwargs)
                 if known_motion is not None:
                     if i == 0:
                         known_next = known_motion
