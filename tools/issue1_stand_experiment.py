@@ -29,7 +29,7 @@ def run(tag,seed,init,segments,manual=False):
   d['raw_suffix_hml']=raw*state.std[None,:,None]+state.mean[None,:,None];d['sampling_seconds']=captured['seconds'];d['init_prefix']=init;np.save(O/f'{tag}_{mode}.npy',d);outputs.append(d)
  for i in range(3):
   m=xyz(one(outputs[-1],i));axis=m[:,2]-m[:,1];axis/=np.maximum(np.linalg.norm(axis,axis=1,keepdims=True),1e-8);x=np.sum((m[:,21]-m[:,17])*axis,axis=1)
-  power=np.abs(np.fft.rfft(x-x.mean()))**2;power[0]=0;freq=np.fft.rfftfreq(len(x),1/20);first=xyz(one(outputs[0],i));h0=height(first);rise=np.flatnonzero(h0>h0[0]+.03)
+  power=np.abs(np.fft.rfft(x-x.mean()))**2;power[0]=0;freq=np.fft.rfftfreq(len(x),1/20);first=xyz(one(outputs[0],i));h0=first[:,21,1];rise=np.flatnonzero(h0>h0[0]+.03)
   row=dict(tag=tag,seed=seed,trial=i+1,prefix=init,segments=segments,reversals=reversals(m),ptp_m=float(np.ptp(x)),dominant_hz=float(freq[np.argmax(power)]),above_fraction=float(np.mean(height(m)>0)),wave_start_height=float(height(m)[0]),start_delay_frame=int(rise[0]) if len(rise) else None)
   if len(outputs)==2:row['raise_end_height']=float(height(xyz(one(outputs[0],i)))[-1])
   if init:
