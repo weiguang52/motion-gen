@@ -73,6 +73,7 @@ class GenerateRequest(BaseModel):
         gt=0,
         description="Exact number of new frames to return; overrides motion_length.",
     )
+    init_prefix: Optional[Literal["stand_mean", "stand_data"]] = None
     blend_mode: Literal["position", "c1"] = "position"
     lookahead_frames: Optional[int] = Field(None, ge=0)
     is_final: bool = False
@@ -396,6 +397,8 @@ def _sample(state: ServerState, req: GenerateRequest) -> bytes:
     lookahead_frames = 0 if req.is_final else (req.lookahead_frames if req.lookahead_frames is not None else int(os.environ.get("MDM_CONTINUATION_LOOKAHEAD_FRAMES", "0")))
     if lookahead_frames < 0 or (lookahead_frames and args.arch != "dit"):
         raise HTTPException(status_code=400, detail="lookahead requires plain dit and nonnegative frames")
+    if req.init_prefix is not None and args.arch != "dit":
+        raise HTTPException(status_code=400, detail="init_prefix requires plain dit")
     continuation_prefix = None
     continuation_decode_state = None
     prefix_frames = 0
@@ -404,6 +407,17 @@ def _sample(state: ServerState, req: GenerateRequest) -> bytes:
         if req.reset_session:
             state.session_motions.pop(req.session_id, None)
             state.session_decode_states.pop(req.session_id, None)
+        if req.init_prefix is not None and req.session_id not in state.session_motions:
+            if not req.continue_from_previous:
+                raise HTTPException(status_code=400, detail="init_prefix requires continue_from_previous")
+            from infer import _load_continuation_prefix
+            init_path = (os.path.join(_REPO_ROOT, "assets", "ar_dit_zero_vel_stand_prefix.npy") if req.init_prefix == "stand_mean" else os.environ.get("MDM_STAND_DATA_PREFIX_NPY", os.path.join(_REPO_ROOT, "assets", "dit_stand_data_prefix.npy")))
+            try:
+                init_motion, init_state = _load_continuation_prefix(init_path, state.mean, state.std, 20, int(state.mean.shape[0]))
+            except (SystemExit, ValueError, OSError) as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            state.session_motions[req.session_id] = init_motion.expand(args.num_samples, -1, -1, -1).clone().detach().cpu()
+            state.session_decode_states[req.session_id] = {key: value.expand(args.num_samples, *value.shape[1:]).clone().detach().cpu() for key, value in init_state.items()}
         if req.continue_from_previous:
             previous_motion = state.session_motions.get(req.session_id)
             if previous_motion is not None:

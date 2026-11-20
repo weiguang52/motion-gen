@@ -39,6 +39,7 @@ def main():
     parser.add_argument("--data_dir", default="dataset/HumanML3D")
     parser.add_argument("--out", default="assets/ar_dit_default_stand_prefix.npy")
     parser.add_argument("--scan_limit", type=int, default=5000)
+    parser.add_argument("--context_len", type=int, default=None)
     parser.add_argument("--stride", type=int, default=2)
     args = parser.parse_args()
 
@@ -46,7 +47,9 @@ def main():
     with open(args_json, "r") as f:
         model_args = json.load(f)
 
-    context_len = int(model_args["context_len"])
+    context_len = args.context_len if args.context_len is not None else int(model_args.get("context_len", 0))
+    if context_len <= 0:
+        raise ValueError("Pass --context_len for checkpoints without a positive context_len")
     expected_dim = 263
 
     data_dir = Path(args.data_dir)

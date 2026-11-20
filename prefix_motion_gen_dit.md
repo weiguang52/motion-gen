@@ -305,3 +305,14 @@ CLI新增 `--continuation_lookahead_frames`（默认0）与 `--continuation_is_f
 ## C1边界实验（默认关闭）
 
 CLI增加 `--continuation_blend_mode position|c1`，服务请求增加 `blend_mode`，默认均为position。c1在位置对齐后对3:193维添加 k·dv·w 的速度修正，0:3根速度维不变，首帧不动，blend区间外不变。短于2帧时不加速度项。离线已有动作B12/20接缝通过率有改善，但修正区间可能产生新过冲，不作为默认发布方案。离线B20为在既有position B12输出上增加20帧速度修正，并不等于重新采样时完整position B20；原始未平滑采样帧未保存，不能混同。
+
+
+## 实验性站立起步（默认关闭）
+
+普通 DiT 请求可指定 `init_prefix="stand_mean"` 或 `"stand_data"`。仅在会话没有历史时注入20帧站姿；已有历史保持续写，reset_session会清除历史并重新初始化。需要continue_from_previous=true。前缀通过CLI相同加载器归一化并重建解码状态，从原点和默认朝向开始积分，输出只含N帧。真实前缀若有微小根角速度，前缀末态会有对应的微小朝向偏移。
+
+stand_mean使用现有assets/ar_dit_zero_vel_stand_prefix.npy。stand_data由维护者运行tools/make_ar_stand_prefix.py --ckpt_dir ... --data_dir ... --context_len 20 --out ...生成，并通过环境变量MDM_STAND_DATA_PREFIX_NPY配置服务器路径（默认assets/dit_stand_data_prefix.npy）。数据资产不提交。CLI可用--continuation_npy传同一个原始[T,263]数组。
+
+本轮复现工具：tools/issue1_stand_experiment.py（S-A、I/D、S-B），tools/issue1_reproduce_raw.py（position B12复现门禁与raw_suffix_hml），tools/issue1_unified_window.py（离线统一窗口与重新择优），tools/issue1_stand_render.py（完整实际提示词与骨架/机器人视频）。工具显式使用服务器材料目录；运行前设置MDM_MODEL_PATH、MDM_USE_EMA和CUDA_VISIBLE_DEVICES。
+
+统一窗口扫描的B是请求值，实际被前缀长度和返回帧数限制。当前P20或N20时，B30实际为20，不能称为真正30帧试验。修正窗口二阶差分使用v2 normal_acc口径（关节范数均值×fps），窗口外p95不足时标记无法验收，不能算成功。离线重修正复用冻结的raw suffix，不等于在修正后历史上再次扩散采样。
