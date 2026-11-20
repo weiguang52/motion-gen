@@ -7,9 +7,13 @@ class ContractTests(unittest.TestCase):
  def test_cli_and_request_defaults(self):
   import infer
   from serve.generate_server import GenerateRequest
-  argv=['infer.py','--model_path','/home/cxm2/data/motion-gen/save/tangwen_t2m_v7_400k/model000400000.pt','--text_prompt','A person waves the right hand.']
-  with patch('sys.argv',argv):self.assertEqual(infer._build_args().continuation_blend_mode,'position')
-  with patch('sys.argv',argv+['--continuation_blend_mode','c1']):self.assertEqual(infer._build_args().continuation_blend_mode,'c1')
+  import tempfile,json
+  from pathlib import Path
+  with tempfile.TemporaryDirectory() as temp:
+   Path(temp,'args.json').write_text(json.dumps({'arch':'dit'}))
+   argv=['infer.py','--model_path',str(Path(temp,'model.pt')),'--text_prompt','A person waves the right hand.']
+   with patch('sys.argv',argv):self.assertEqual(infer._build_args().continuation_blend_mode,'position')
+   with patch('sys.argv',argv+['--continuation_blend_mode','c1']):self.assertEqual(infer._build_args().continuation_blend_mode,'c1')
   self.assertEqual(GenerateRequest(text='wave').blend_mode,'position')
   with self.assertRaises(ValueError):GenerateRequest(text='wave',blend_mode='bad')
  def test_service_frozen_sampler_routes_c1(self):
