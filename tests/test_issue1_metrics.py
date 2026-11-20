@@ -1,6 +1,6 @@
 import unittest
 import numpy as np
-from tools.issue1_evaluate import metric,independent
+from tools.issue1_evaluate_v1 import metric,independent
 class MetricsTests(unittest.TestCase):
  def data(self,n,height):
   m=np.zeros((1,22,3,n));m[0,2,0,:]=1;m[0,21,1,:]=height;return {'motion':m}
