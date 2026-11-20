@@ -300,3 +300,8 @@ python -m py_compile \
 ## 实验性前瞻尾帧
 
 CLI新增 `--continuation_lookahead_frames`（默认0）与 `--continuation_is_final`。服务新增 `lookahead_frames`、`is_final` 及默认值环境变量 `MDM_CONTINUATION_LOOKAHEAD_FRAMES`。仅普通DiT使用。采样P+N+L不超过196；在平滑、解码和保存会话之前丢弃尾帧，仅返回N帧。末段强制L0。较长前缀不能超过已实际返回历史。默认保持原行为；尚未通过最终动作质量验收。CLI的 `--continuation_repaint_repeats` 仅用于消融，默认1。
+
+
+## C1边界实验（默认关闭）
+
+CLI增加 `--continuation_blend_mode position|c1`，服务请求增加 `blend_mode`，默认均为position。c1在位置对齐后对3:193维添加 k·dv·w 的速度修正，0:3根速度维不变，首帧不动，blend区间外不变。短于2帧时不加速度项。离线已有动作B12/20接缝通过率有改善，但修正区间可能产生新过冲，不作为默认发布方案。离线B20为在既有position B12输出上增加20帧速度修正，并不等于重新采样时完整position B20；原始未平滑采样帧未保存，不能混同。

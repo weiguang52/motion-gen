@@ -2,6 +2,7 @@
 Brief:
 Serve DDPM DiT / AR-DiT text-to-motion generation over FastAPI.
 """
+from typing import Literal
 import argparse
 import copy
 import io
@@ -72,6 +73,7 @@ class GenerateRequest(BaseModel):
         gt=0,
         description="Exact number of new frames to return; overrides motion_length.",
     )
+    blend_mode: Literal["position", "c1"] = "position"
     lookahead_frames: Optional[int] = Field(None, ge=0)
     is_final: bool = False
     session_id: str = Field(
@@ -485,6 +487,7 @@ def _sample(state: ServerState, req: GenerateRequest) -> bytes:
                 continuation_prefix,
                 sample[..., prefix_frames:],
                 blend_frames,
+                blend_mode=req.blend_mode,
             )
         if args.arch == "dit":
             state.session_motions[req.session_id] = sample.detach().cpu()
@@ -515,6 +518,7 @@ def _sample(state: ServerState, req: GenerateRequest) -> bytes:
         "num_samples": args.num_samples,
         "num_repetitions": args.num_repetitions,
         "session_id": req.session_id,
+        "continuation_blend_mode": req.blend_mode,
         "continuation_lookahead_frames": lookahead_frames,
         "continuation_prefix_frames": prefix_frames,
         "continuation_blend_frames": blend_frames,

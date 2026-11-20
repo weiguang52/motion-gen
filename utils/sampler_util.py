@@ -44,8 +44,10 @@ def blend_dynamic_text_embed(prev_embed, cur_embed, blend):
     }
 
 
-def smooth_continuation_boundary(prefix, suffix, blend_frames):
+def smooth_continuation_boundary(prefix, suffix, blend_frames, blend_mode="position"):
     """Match the new HumanML segment to the prefix, then fade back to the sampled suffix."""
+    if blend_mode not in {"position", "c1"}:
+        raise ValueError("blend_mode must be position or c1")
     prefix = prefix.to(device=suffix.device, dtype=suffix.dtype)
     blend_frames = min(int(blend_frames), prefix.shape[-1], suffix.shape[-1])
     if blend_frames <= 0:
@@ -81,6 +83,11 @@ def smooth_continuation_boundary(prefix, suffix, blend_frames):
 
     smoothed = suffix.clone()
     smoothed[..., :blend_frames] += correction * weights
+    if blend_mode == "c1" and blend_frames >= 2 and prefix.shape[-1] >= 2:
+        end = min(193, smoothed.shape[1])
+        dv = (prefix[:, 3:end, :, -1:] - prefix[:, 3:end, :, -2:-1]) - (smoothed[:, 3:end, :, 1:2] - smoothed[:, 3:end, :, :1])
+        k = torch.arange(blend_frames, device=suffix.device, dtype=suffix.dtype).view(1, 1, 1, -1)
+        smoothed[:, 3:end, :, :blend_frames] += k * dv * weights
     return smoothed
 
 

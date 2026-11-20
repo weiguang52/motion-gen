@@ -68,6 +68,7 @@ def _build_args() -> argparse.Namespace:
     add_data_options(parser)
     add_model_options(parser)
     add_diffusion_options(parser)
+    parser.add_argument("--continuation_blend_mode", choices=["position", "c1"], default="position")
     parser.add_argument("--continuation_repaint_repeats", type=int, default=1)
     parser.add_argument("--continuation_lookahead_frames", type=int, default=0)
     parser.add_argument("--continuation_is_final", action="store_true")
@@ -463,6 +464,7 @@ def main():
                     continuation_prefix,
                     suffix,
                     args.continuation_blend_frames,
+                    blend_mode=args.continuation_blend_mode,
                 )
             hml_vec = sample.cpu().permute(0, 2, 3, 1)
             hml_vec = (hml_vec * std) + mean
@@ -503,6 +505,7 @@ def main():
         "num_samples": args.num_samples,
         "num_repetitions": args.num_repetitions,
         "model_path": args.model_path,
+        "continuation_blend_mode": args.continuation_blend_mode,
         "continuation_lookahead_frames": lookahead_frames,
         "continuation_prefix_frames": prefix_frames,
         "continuation_blend_frames": min(args.continuation_blend_frames, n_frames) if prefix_frames else 0,
